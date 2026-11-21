@@ -13,8 +13,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.9", "3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
         include:
+          # ubuntu-latest (26.04) no longer ships CPython 3.9 builds
+          - os: ubuntu-24.04
+            python-version: "3.9"
           - os: macos-latest
             python-version: "3.12"
           - os: windows-latest
@@ -36,6 +39,7 @@ jobs:
         run: python -m pytest tests -q
 
       - name: Console script works
+        shell: bash
         run: |
           oasis-dm --version
           oasis-dm --help > /dev/null
@@ -43,6 +47,7 @@ jobs:
       - name: End-to-end run on a bundled case
         shell: bash
         run: |
+          mkdir -p out
           oasis-dm --mtzin tests/data/7e1d.mtz --mtzout out/ci.mtz \
                    --stats out/ci.json --no-auto-stop --cycles 2 --quiet
           python - <<'EOF'
