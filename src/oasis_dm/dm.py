@@ -40,9 +40,11 @@ try:
     from . import __version__
     from .core import (Config, DensityModifier, hl_centroid, wrap180,
                        fom_to_x, x_to_fom, build_parser)
+    from . import ncs
 except ImportError:  # direct script execution
     from core import (Config, DensityModifier, hl_centroid, wrap180,
                       fom_to_x, x_to_fom, build_parser)
+    import ncs
 
 
 @dataclass
@@ -58,6 +60,9 @@ class ConfigV2(Config):
                                     # extension) progressively
     ext_steps: int = 5              # cycles over which extension activates
     aniso: bool = False             # per-cycle anisotropic Fo -> |Fmod| scaling
+    ncs: str = ''                   # path to an NCS operator file (fractional)
+    ncs_auto: bool = False          # detect the operator from the cycle-2 map,
+                                    # gated on the free-set score
     auto_stop: bool = True
     max_cycles: int = 8
     min_cycles: int = 2
@@ -329,6 +334,14 @@ class DensityModifierV2(DensityModifier):
         prev_score = None
         plateau = 0
         free_scored = False
+        # --- optional NCS averaging --------------------------------------
+        self._ncs_av = None
+        self._ncs_tried = False
+        if cfg.ncs:
+            ops = ncs.read_operators(cfg.ncs, self.cell)
+            self._ncs_av = ncs.NcsAverager(ops, spacegroup=self.sg, cell=self.cell)
+            self.log(f'[v2  ] NCS averaging: {len(ops)} operator(s) from '
+                     f'{cfg.ncs}')
         self._Fo_raw = self.Fo.copy()       # anisotropic correction is always
                                             # applied to the RAW amplitudes
         # --- optional anisotropic scaling of Fo (once; data-only estimate) --
@@ -402,6 +415,64 @@ class DensityModifierV2(DensityModifier):
             mean_fom_now = float(np.mean(m_best[self.valid]))
             modify, mask_solv, mask_prot, d_eff = self._build_modifier(
                 rho, radius, mean_fom_now)
+            # --- optional NCS averaging (wraps the modification) ---------
+            # detection waits for cycle 2: one solvent-flattening round
+            # first lifts the map SNR enough for the local-correlation
+            # search to see the NCS mates
+            if (cfg.ncs_auto and self._ncs_av is None
+                    and not self._ncs_tried and cyc >= 2):
+                self._ncs_tried = True
+                det = ncs.detect_ncs(rho, mask_prot > 0.5, self.cell, self.sg,
+                                    log=self.log)
+                if det is not None:
+                    R_f, t_f, score = det
+                    av = ncs.NcsAverager(
+                        [(R_f, t_f)], spacegroup=self.sg, cell=self.cell)
+                    self.log(f'[v2  ] NCS auto-detection: operator found '
+                             f'(score {score:.3f})')
+                    # --- free-set gate -------------------------------------
+                    # Averaging with a mediocre operator, or on a map that
+                    # plain DM already solves, can hurt.  Trial both
+                    # variants on THIS cycle's map and keep averaging
+                    # only if it does not degrade the free-set cc.
+                    def _trial_cc(mdf):
+                        g = None
+                        if cfg.gamma_on:
+                            g, rmod = self._estimate_gamma(rho, mdf)
+                        else:
+                            rmod = mdf(rho)
+                        if g is not None:
+                            rmod = (rmod - g * rho) / (1.0 - g)
+                        fmo = self._map_with_deleted(F_omit, phi_deg, mdf, g)
+                        return self._free_metric(np.abs(fmo))[0]
+
+                    cc_plain = _trial_cc(modify)
+                    cc_ncs = _trial_cc(av.wrap(modify, mask_prot > 0.5))
+                    # the amplitude-only free metric cannot see phase
+                    # damage from a mediocre operator, so a bare >= is
+                    # not enough: on 7tj1 a single half-detected
+                    # operator scored +0.014 free cc and cost 0.07 cos
+                    # of truth.  demand a clear margin.
+                    margin = 0.03
+                    if not (np.isfinite(cc_plain) and np.isfinite(cc_ncs)):
+                        self._ncs_av = av   # no usable free set: trust NCS
+                        self.log('[v2  ] NCS gate: no usable free set; '
+                                 'keeping averaging')
+                    elif cc_ncs > cc_plain + margin:
+                        self._ncs_av = av
+                        self.log(f'[v2  ] NCS gate: free cc {cc_ncs:.3f} '
+                                 f'(with NCS) > {cc_plain:.3f} (plain) + '
+                                 f'{margin}; keeping averaging')
+                    else:
+                        self.log(f'[v2  ] NCS gate: free cc {cc_ncs:.3f} '
+                                 f'(with NCS) <= {cc_plain:.3f} (plain) + '
+                                 f'{margin}; falling back to plain density '
+                                 'modification')
+                else:
+                    self.log('[v2  ] NCS auto-detection: no operator found, '
+                             'continuing without averaging')
+            if self._ncs_av is not None:
+                modify = self._ncs_av.wrap(modify, mask_prot > 0.5)
             gamma = None
             if cfg.gamma_on:
                 gamma, rho_mod = self._estimate_gamma(rho, modify)
@@ -489,6 +560,9 @@ class DensityModifierV2(DensityModifier):
                                             if np.any(ext_act) else None),
                               n_ext_active=int(ext_act.sum()),
                               aniso=self._aniso,
+                              ncs_avg_frac=(self._ncs_av.last_frac
+                                            if self._ncs_av is not None
+                                            else None),
                               free_cc=free_cc, free_r_omit=free_r,
                               sigmaq_median=qmed, gamma=gamma, d_eff=d_eff,
                               mask_radius=radius,
@@ -579,6 +653,8 @@ class DensityModifierV2(DensityModifier):
                                      n_ext=int(np.sum(self.ext)),
                                      n_ext_activated=int(np.sum(self.ext_activated)),
                                      aniso=self.cfg.aniso,
+                                     ncs=(self.cfg.ncs or None),
+                                     ncs_auto=self.cfg.ncs_auto,
                                      best_free_cc=max(
                                          (s['free_cc'] for s in self.stats
                                           if np.isfinite(s['free_cc'])),
@@ -616,6 +692,18 @@ def build_parser_v2():
                    help='per-cycle anisotropic scaling of Fo towards |Fmod| '
                         '(6-parameter fit; the corrected amplitudes are used '
                         'internally and written to FDM)')
+    p.add_argument('--ncs', default='',
+                   help='NCS operator file: per operator 3 lines of '
+                        '"r11 r12 r13 t1" (fractional rotation row + '
+                        'translation); averaging is applied inside the '
+                        'protein-mask intersection')
+    p.add_argument('--ncs-auto', action='store_true', default=False,
+                   help='detect an NCS operator automatically from the '
+                        'cycle-2 map (SO(3) scan + FFT translation search) '
+                        'and keep averaging only if the free-set score '
+                        'beats plain density modification by a clear '
+                        'margin (amplitude-only scores cannot see phase '
+                        'damage, so ties fall back to plain)')
     p.add_argument('--auto-stop', action='store_true', default=True)
     p.add_argument('--no-auto-stop', dest='auto_stop', action='store_false',
                    help='disable free-set early stopping (fixed --cycles)')
@@ -666,7 +754,7 @@ def main(argv=None):
                    omit_fc=args.omit_fc, hist_mode=args.hist_mode,
                    per_shell_d=args.per_shell_d, kfold=args.kfold,
                    extend=args.extend, ext_steps=args.ext_steps,
-                   aniso=args.aniso)
+                   aniso=args.aniso, ncs=args.ncs, ncs_auto=args.ncs_auto)
     DensityModifierV2(cfg).run()
     return 0
 

@@ -4,6 +4,81 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.0] — 2026-11-22
+
+Three engine capabilities: honest k-fold FOM calibration, phase extension with
+anisotropic correction, and NCS averaging. Everything below was measured
+against reference phases on the bundled cases.
+
+### Added
+
+- **NCS averaging (`--ncs FILE`).** Operator files list proper rotations in
+  fractional coordinates (`x' = R_f x + t_f`, three `r r r t` rows per
+  operator); improper rotations are rejected. The operator set is closed under
+  space-group conjugation and inverse walks, so open A→B-only files work and
+  the averaged map stays space-group symmetric. Averaging runs after solvent
+  flattening and histogram matching inside every cycle; the perturbation-γ
+  estimate and the k-fold Σ_Q predictions both see the averaged map, so the
+  honesty properties below carry over.
+  - Operators fitted on unwrapped coordinates obey `O(f + L) = O(f) + R·L`;
+    all 27 lattice placements `t + R·L` are evaluated per operator power (the
+    grid cannot be pre-rolled — `R·L` is not an integer offset in general).
+  - Mask regions are partitioned by Voronoi growth from confident seeds
+    (double-smoothed local correlation > 0.30), following the molecular copies
+    even when the protein mask is one connected blob.
+  - The blend weight is the double-smoothed local correlation of the assigned
+    variant (≤ 0.10 keeps the un-averaged density, ≥ 0.25 replaces it fully):
+    a failed partner search degrades that region only instead of smearing the
+    map.
+- **`--ncs-auto`.** From cycle 2 the engine can detect a proper-rotation
+  operator from the current map (core-mask rotation scan + Nelder–Mead
+  rotation/translation refinement) and enables it only when the free-set
+  correlation beats plain density modification by a clear margin (+0.03;
+  amplitude-only free scores cannot see phase damage, so ties fall back to
+  plain). A bare >= comparison was tried and rejected: on `7tj1` it kept a
+  single half-detected operator (local cc 0.32, one of the three true ones)
+  that looked +0.014 better on free amplitudes yet cost 0.07 cos of truth
+  (0.465 vs 0.538 plain). With the margin the gate declines to average on
+  every bundled case — `7e1d` (spurious operator), `3i0t_hard`, `7tj1` —
+  making it a conservative safety net rather than a substitute for the
+  expert operator file.
+- **k-fold omit maps (`--sigmaq-source kfold`).** Every work reflection is
+  predicted from a map built without it (shell-balanced folds, free set always
+  deleted). Fitting D and Σ_Q on these out-of-map predictions removes the
+  self-reference bias that inflated FOM in v1. Measured on the bundled cases
+  (cmbwt 0.4): FOM optimism 0.086/0.253/0.128 vs 0.106/0.296/0.145 for the
+  blend estimate, at the same phase accuracy. `--kcal` additionally rescales
+  the per-shell von Mises concentration from the k-fold phase disagreement;
+  it helps `6zpp` but not the other cases, so it stays opt-in/experimental.
+- **Phase extension (on by default, `--no-extend` to disable).** Reflections
+  with `Fo` but no starting phase (NaN `PHIB`/`FOM`) are activated
+  progressively, coarse shells first over `--ext-steps` cycles (default 5);
+  never-activated extension reflections in the free set get phase/FOM from
+  the best map prediction. Early stopping waits for full activation.
+- **`--aniso` — anisotropic amplitude correction.** One-shot 6-parameter
+  scaling of `Fo` from direction statistics (`ln Fo − ⟨ln Fo⟩_shell ∼ c +
+  h'Bh`), capped at 0.5–2.0×. (Fitting `Fo` against `|Fmod|` was tried and
+  rejected as circular — the map inherits its own anisotropy.)
+- **NCS test cases** `3i0t`/`3i0t_hard` (2-fold) and `7tj1` (4-copy, 3
+  operators) with operator files, and `tools/make_test_case.py --ncs-out` to
+  regenerate them or build new ones from any PDB entry; `tests/test_ncs.py`.
+
+### Measured (NCS)
+
+Mean cos phase error vs reference (`PHIC`), work reflections:
+
+| case | plain | `--ncs` |
+| --- | ---: | ---: |
+| 7tj1 (4-copy, operators 0.16–0.46 Å rmsd, wMPE 58°) | 0.538 | 0.552 |
+| 3i0t (2-fold, operator 1.02 Å rmsd, wMPE 53°) | 0.728 | 0.679 |
+| 3i0t_hard (2-fold, operator 1.02 Å rmsd, wMPE 70°) | 0.358 | 0.330 |
+
+NCS averaging pays when the operators are tight and the copies are many (7tj1:
++0.014 cos); a loose operator costs accuracy and the poorer the starting phases
+the deeper the loss (3i0t/3i0t_hard). That asymmetry is why the automatic mode
+gates on the free set (on `7e1d` it detects a spurious operator and keeps
+averaging off) and `--ncs` is documented as an expert option.
+
 ## [2.1.0] — 2026-11-21
 
 Focused on correctness, measured rather than assumed. Everything below was

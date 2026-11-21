@@ -40,6 +40,79 @@ oasis-dm --mtzin input.mtz --mtzout output.mtz \
 `python -m oasis_dm ...` is equivalent. The engine stops on its own when the free-set score
 plateaus; `--no-auto-stop --cycles N` forces a fixed number of cycles.
 
+For a multi-copy ASU with known non-crystallographic symmetry, add the operator file:
+
+```bash
+oasis-dm --mtzin input.mtz --mtzout output.mtz ... \
+         --ncs ncs_operators.txt     # or --ncs-auto to detect + gate it
+```
+
+---
+
+## NCS averaging
+
+`--ncs FILE` averages the density over NCS-related copies inside every cycle, after solvent
+flattening and histogram matching. The file lists one operator per three lines, fractional
+coordinates, `x' = R_f x + t_f` (the format `tools/make_test_case.py --ncs-out`
+produces):
+
+```
+# A -> B
+r11 r12 r13 t1
+r21 r22 r23 t2
+r31 r32 r33 t3
+```
+
+Improper rotations (det = −1) are rejected; proper rotations of any order are accepted, and
+open operators (A→B without B→A) are closed by adding the inverse walk.
+
+What the averager actually does, and why:
+
+* **Lattice variants.** An operator fitted on unwrapped coordinates obeys
+  `O(f + L) = O(f) + R·L`, so the 27 unit-cell offsets `t + R·L` are all valid placements of
+  the same operator. Each mask region uses the variant that actually lands on density; the
+  grid cannot be pre-rolled because `R·L` is not generally an integer offset.
+* **Voronoi partition.** Voxels whose local map correlation clearly favours one variant
+  (double box-smoothed cc > 0.30) act as seeds; every other mask voxel adopts the variant of
+  the nearest seed. This follows the molecular copies even when the protein mask is one
+  connected blob.
+* **Confidence weights.** The blend weight is the smoothed local correlation of the assigned
+  variant: ≤ 0.10 → no averaging, ≥ 0.25 → full replacement. Regions where no partner can be
+  found keep the un-averaged density, so weak or wrong operators degrade the map gracefully
+  instead of smearing it.
+* **Space-group closure.** The operator set is closed under crystallographic conjugation, so
+  every crystallographic image of a copy is averaged with its own mate and the result stays
+  space-group symmetric.
+
+`--ncs-auto` leaves averaging off for the first cycles, then detects an
+operator from the current map (a rotation scan on a tight core mask, Nelder–Mead refinement
+of rotation + translation) and enables it **only if the free-set correlation beats plain
+density modification by a clear margin** (+0.03; the free metric is amplitude-only and
+cannot see phase damage, so ties fall back to plain); otherwise the run continues as plain
+density modification. It is a conservative safety net, not a substitute for the operator
+file: on the bundled cases it declines to average every time — a spurious operator on the
+non-NCS control (`7e1d`), a harmful one on `3i0t_hard`, and on `7tj1` a single
+half-detected operator (one of the three true ones, local cc 0.32) whose averaging looked
++0.014 better on the free amplitudes but cost 0.07 cos of truth. The measured `7tj1` win
+needs the complete expert operator file.
+
+Measured on the bundled NCS cases (mean cos phase error vs reference, higher is better):
+
+| case | plain | `--ncs` | copies | operator CA rmsd | starting wMPE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 7tj1 | 0.538 | **0.552** | 4 | 0.16–0.46 Å | 58° |
+| 3i0t | 0.728 | 0.679 | 2 | 1.02 Å | 53° |
+| 3i0t_hard | 0.358 | 0.330 | 2 | 1.02 Å | 70° |
+
+Read the table as the honest caveat: **NCS averaging pays when the operators are
+tight and the copies are many**. On 7tj1 (four copies, sub-Å operators) averaging
+supplies information that solvent flattening alone cannot and wins +0.014 cos. On
+3i0t the two chains differ by 1.02 Å CA rmsd — a loose operator — and forcing the
+map onto the NCS average costs more than it gains; the poorer the starting phases,
+the deeper the loss (3i0t_hard). That is why `--ncs` is documented as an expert
+option and `--ncs-auto` gates on the free set: on the bundled non-NCS control
+(7e1d) the gate detects a spurious operator and never enables averaging.
+
 ---
 
 ## Benchmark
@@ -187,6 +260,8 @@ Each cycle:
 | `--max-cycles` | 8 | true phase error is flat from ~cycle 5 |
 | `--hist-mode` | `cell` | `protein` conditions the target on `--solc` |
 | `--per-shell-d` | off | per-shell σ_A in `FWT` (no measurable effect on the bundled cases) |
+| `--ncs FILE` | off | NCS operator file; averaging runs from cycle 1 — know your operators |
+| `--ncs-auto` | off | detect an operator at cycle ≥ 2 and enable it only if the free-set score improves |
 
 Everything else — `--x-max`, `--n-shells`, `--radius-decay`, `--sample-rate` — is saturated on
 the bundled cases: sweeping them moves the weighted phase error by less than 1°.
@@ -203,8 +278,14 @@ the bundled cases: sweeping them moves the weighted phase error by less than 1°
    removed rather than shipped (see `CHANGELOG.md`).
 2. **Three cases, one resolution.** All bundled cases are 2.5 Å SAD data with ~50% solvent.
    Nothing here is calibrated for low-resolution SAD, SIR/MIR, or very high solvent content.
-3. **No NCS averaging, no anisotropic correction, no phase extension.** NCS averaging is the
-   largest missing component for multi-copy ASUs.
+3. **NCS averaging is operator-limited.** The gain is set by the quality of the
+   operators, not by how poor the phases are: tight sub-Å operators on many
+   copies win (7tj1), a loose operator loses, and the poorer the starting
+   phases the deeper the loss. The correlation-weighted blend protects the map
+   (regions where no partner is found keep un-averaged density) but cannot
+   rescue a wrong or loose operator. Only proper rotations are supported, and
+   operators stay fixed during the run (they are not re-refined against the
+   improving map).
 4. **Free-set handling.** The free flag drives stopping and the omit map; free reflections are
    not used as extra phase observations. Below ~500 free reflections the omit-based σ_Q path
    (`--sigmaq-source omit`) falls back to a work-dominated estimate.
@@ -220,7 +301,8 @@ the bundled cases: sweeping them moves the weighted phase error by less than 1°
 ```
 src/oasis_dm/
   core.py            v1 engine + shared numerics (mask, histogram LUT, HL recombination, I/O)
-  dm.py              v2 engine: omit map, free-set stopping, CLI
+  dm.py              v2 engine: omit map, free-set stopping, phase extension, CLI
+  ncs.py             NCS averaging (operator I/O, lattice variants, auto-detection)
   cli.py             console entry point
   paths.py           histogram-library resolution
   data/protein_hist.lib   bundled target distribution
@@ -228,8 +310,9 @@ tools/
   benchmark.py       benchmark vs reference phases (+ optional cparrot)
   evaluate.py        scoring against reference phases (plots optional)
   make_hist_lib.py   regenerate the bundled histogram library
+  make_test_case.py  build a bundled-style test case (+ NCS operator files) from a PDB entry
   run_tests.py       test runner that needs no pytest
-tests/               smoke tests, numerics tests, bundled cases
+tests/               smoke tests, numerics tests, bundled cases (incl. NCS cases)
 examples/            runnable example
 handdm_v2.py         compatibility shim for pipelines that resolve the engine by file name
 ```

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Run oasis_dm on a bundled case and score the result against the reference phases.
-#   ./examples/run_example.sh [tag]      # tag defaults to 7e1d; also 6zpp, 3o2e
+#   ./examples/run_example.sh [tag]      # tag defaults to 7e1d; also 6zpp, 3o2e,
+#                                         # and the NCS cases 3i0t, 3i0t_hard, 7tj1
+#                                         # (an operator file tests/data/<tag>_ncs.txt
+#                                         # is picked up automatically)
 # Set HIST_LIB=/path/to/hist.lib if you want histogram matching; without it the
 # script falls back to --no-hist.
 set -euo pipefail
@@ -22,6 +25,11 @@ fi
 mkdir -p out
 ARGS=(--mtzin "$CASE" --mtzout "out/${TAG}_v2.mtz"
       --stats "out/${TAG}_v2_stats.json" --tag "$TAG" --solc 0.5)
+
+# NCS cases ship with an operator file next to the data
+if [ -f "tests/data/${TAG}_ncs.txt" ]; then
+  ARGS+=(--ncs "tests/data/${TAG}_ncs.txt")
+fi
 
 if [ -n "${HIST_LIB:-}" ]; then
   ARGS+=(--hist-lib "$HIST_LIB")

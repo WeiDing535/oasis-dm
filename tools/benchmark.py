@@ -9,6 +9,7 @@ section comes from this script.
 
     python tools/benchmark.py                     # bundled cases
     python tools/benchmark.py --cases 7e1d 3o2e
+    python tools/benchmark.py --ncs               # NCS cases, plain vs --ncs
     python tools/benchmark.py --parrot            # also run cparrot, if installed
     python tools/benchmark.py --out out/bench
 
@@ -17,6 +18,10 @@ solvent flattening + histogram matching, 5 cycles, 50% solvent -- the closest
 equivalent recipe.  cparrot's phase probability is converted to a centroid phase
 and FOM before scoring, which is exactly what oasis_dm outputs as
 ``DM_PHIDM``/``DM_FOMDM``.
+
+``--ncs`` runs the bundled NCS cases (``3i0t``, ``3i0t_hard``, ``7tj1``) twice,
+plain and with ``--ncs tests/data/<tag>_ncs.txt``, reproducing the NCS table in
+the README.
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = ["7e1d", "6zpp", "3o2e"]
+NCS_CASES = ["3i0t", "3i0t_hard", "7tj1"]
 def run(cmd, env=None, cwd=None):
     return subprocess.run(cmd, cwd=str(cwd or ROOT), capture_output=True,
                           text=True, env=env)
@@ -86,16 +92,21 @@ o.write_to_file(out)
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--cases", nargs="+", default=DEFAULT_CASES,
+    ap.add_argument("--cases", nargs="+", default=None,
                     help="bundled case tags (tests/data/<tag>.mtz)")
     ap.add_argument("--cycles", type=int, default=None,
                     help="fixed cycle count; default uses the engine's auto stop")
     ap.add_argument("--parrot", action="store_true", help="also run CCP4 cparrot")
+    ap.add_argument("--ncs", action="store_true",
+                    help="run the bundled NCS cases plain and with --ncs "
+                         "(reproduces the README NCS table)")
     ap.add_argument("--out", default="out/bench", help="output directory")
     ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
                     help="extra oasis_dm options, e.g. --extra --no-hist "
                          "(must come last)")
     args = ap.parse_args(argv)
+    if args.cases is None:
+        args.cases = NCS_CASES if args.ncs else DEFAULT_CASES
 
     outdir = Path(args.out).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -110,20 +121,29 @@ def main(argv=None):
         if not case.is_file():
             print("skip %s (missing %s)" % (tag, case))
             continue
-        mtz_out = outdir / (tag + "_dm.mtz")
-        cmd = [sys.executable, "-m", "oasis_dm", "--mtzin", str(case),
-               "--mtzout", str(mtz_out), "--solc", "0.5", "--quiet"]
-        if args.cycles:
-            cmd += ["--no-auto-stop", "--cycles", str(args.cycles)]
-        cmd += [a for a in args.extra if a != "--"]
-        r = run(cmd, env=env)
-        if r.returncode != 0:
-            print("FAILED %s:\n%s" % (tag, r.stderr[-1500:]))
-            continue
-        rows.setdefault("input", {})[tag] = score(
-            case, str(case), "PHIB", "FOM", outdir / (tag + "_in"), env)
-        rows.setdefault("oasis_dm", {})[tag] = score(
-            case, str(mtz_out), "DM_PHIDM", "DM_FOMDM", outdir / (tag + "_dm"), env)
+        # variants: plain, and --ncs when the case has an operator file
+        variants = [("oasis_dm", [])]
+        opfile = ROOT / "tests" / "data" / (tag + "_ncs.txt")
+        if args.ncs and opfile.is_file():
+            variants.append(("oasis_dm --ncs", ["--ncs", str(opfile)]))
+        for vname, vflags in variants:
+            mtz_out = outdir / ("%s%s.mtz" % (tag, "" if vname == "oasis_dm"
+                                              else "_ncs"))
+            cmd = [sys.executable, "-m", "oasis_dm", "--mtzin", str(case),
+                   "--mtzout", str(mtz_out), "--solc", "0.5", "--quiet"]
+            if args.cycles:
+                cmd += ["--no-auto-stop", "--cycles", str(args.cycles)]
+            cmd += vflags + [a for a in args.extra if a != "--"]
+            r = run(cmd, env=env)
+            if r.returncode != 0:
+                print("FAILED %s (%s):\n%s" % (tag, vname, r.stderr[-1500:]))
+                continue
+            rows.setdefault("input", {})[tag] = score(
+                case, str(case), "PHIB", "FOM", outdir / (tag + "_in"), env)
+            rows.setdefault(vname, {})[tag] = score(
+                case, str(mtz_out), "DM_PHIDM", "DM_FOMDM",
+                outdir / (tag + ("_dm" if vname == "oasis_dm" else "_dmncs")),
+                env)
 
         if parrot:
             pmtz = outdir / (tag + "_parrot.mtz")
@@ -142,7 +162,7 @@ def main(argv=None):
     tags = [t for t in args.cases if any(t in v for v in rows.values())]
     lines = ["| method | " + " | ".join(t for t in tags) + " |",
              "| --- |" + " ---: |" * len(tags)]
-    for name in ("input", "oasis_dm", "cparrot"):
+    for name in ("input", "oasis_dm", "oasis_dm --ncs", "cparrot"):
         if name not in rows:
             continue
         cells = []
