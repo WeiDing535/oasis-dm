@@ -322,9 +322,13 @@ class DensityModifier:
             self.free = np.zeros(self.nref, dtype=bool)
         else:
             self.free = (free == cfg.free_marker)
-        self.valid = (np.isfinite(self.Fo) & (self.Fo > 0)
-                      & np.isfinite(self.phi_exp_deg) & np.isfinite(self.fom_in))
+        has_phase = (np.isfinite(self.phi_exp_deg) & np.isfinite(self.fom_in))
+        self.valid = (np.isfinite(self.Fo) & (self.Fo > 0) & has_phase)
         self.work = self.valid & ~self.free
+        # Phase-extension candidates: measured amplitudes with no starting
+        # phase (NaN PHIB or NaN FOM).  The v2 engine activates them
+        # progressively; v1 ignores them exactly as before.
+        self.ext = (np.isfinite(self.Fo) & (self.Fo > 0) & ~has_phase)
 
         # HL prior: prefer explicit HL coefficients (they carry bimodality).
         hl_labels = [x.strip() for x in cfg.hl.split(',') if x.strip()]

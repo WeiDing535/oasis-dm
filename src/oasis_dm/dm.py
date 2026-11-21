@@ -39,10 +39,10 @@ import numpy as np
 try:
     from . import __version__
     from .core import (Config, DensityModifier, hl_centroid, wrap180,
-                       fom_to_x, build_parser)
+                       fom_to_x, x_to_fom, build_parser)
 except ImportError:  # direct script execution
     from core import (Config, DensityModifier, hl_centroid, wrap180,
-                      fom_to_x, build_parser)
+                      fom_to_x, x_to_fom, build_parser)
 
 
 @dataclass
@@ -54,6 +54,10 @@ class ConfigV2(Config):
                                     # 'omit' (unbiased attempt, needs scale
                                     # correction to be stable) | 'work'
     kfold: int = 5                  # number of k-fold omit maps per cycle
+    extend: bool = True             # activate unphased amplitudes (phase
+                                    # extension) progressively
+    ext_steps: int = 5              # cycles over which extension activates
+    aniso: bool = False             # per-cycle anisotropic Fo -> |Fmod| scaling
     auto_stop: bool = True
     max_cycles: int = 8
     min_cycles: int = 2
@@ -79,7 +83,14 @@ class DensityModifierV2(DensityModifier):
     """v1 engine + omit-based error estimation + free-set early stopping."""
 
     def _prepare(self):
+        cfg = self.cfg
+        if cfg.extend and np.any(self.ext):
+            # the FFT grid must sample the finest *measured* amplitude, or the
+            # extension predictions alias; with extension off, v2 keeps v1's
+            # behaviour of sizing the grid to the phased data only
+            self.dmin = min(self.dmin, float(np.nanmin(self.d[self.ext])))
         super()._prepare()
+        self._active = self.valid     # phased + activated extension (run())
         self.free_valid = self.free & self.valid
         self.n_free_valid = int(self.free_valid.sum())
         if self.n_free_valid < 50:
@@ -213,7 +224,7 @@ class DensityModifierV2(DensityModifier):
             if not (np.isfinite(Qs[s]) and Qs[s] > 0):
                 Ds[s], Qs[s] = Dg, Qg
         for s in range(cfg.n_shells):
-            idx = self.valid & (self.shell == s)
+            idx = self._active & (self.shell == s)
             if np.any(idx):
                 X[idx] = np.clip(2.0 * Fo[idx] * (Ds[s] * Fc_full[idx]) / Qs[s],
                                  0.0, cfg.x_max)
@@ -256,6 +267,52 @@ class DensityModifierV2(DensityModifier):
         rfree = float(np.sum(np.abs(fo - k * fc)) / np.sum(fo))
         return cc, rfree
 
+    def _fit_aniso(self):
+        """Anisotropic amplitude scaling from direction statistics.
+
+        Fits  ln Fo - <ln Fo>_shell ~ c + h^T B h  on work reflections: the
+        per-shell mean is the isotropic reference, so B captures the
+        direction-dependent falloff of the measured amplitudes.  (Fitting Fo
+        against |Fmod| instead would be circular -- the map is built from Fo
+        and inherits the anisotropy, leaving no residual to detect.)
+
+        Returns the 7 coefficients [c, B11, B22, B33, B12, B13, B23] or None
+        when there is too little data.  h are integer Miller indices: the
+        anisotropy is tied to the crystal axes, so fractional indices are the
+        natural coordinate system.
+        """
+        cfg = self.cfg
+        sel = self.work & np.isfinite(self._Fo_raw) & (self._Fo_raw > 0)
+        if int(sel.sum()) < 200:
+            return None
+        h = self.hkl[sel].astype(np.float64)
+        lfo = np.log(self._Fo_raw[sel])
+        sh = self.shell[sel]
+        mu = np.zeros(cfg.n_shells)
+        for s in range(cfg.n_shells):
+            m = sh == s
+            if np.any(m):
+                mu[s] = lfo[m].mean()
+        y = lfo - mu[sh]
+        A = np.column_stack([np.ones(len(h)),
+                             h[:, 0] ** 2, h[:, 1] ** 2, h[:, 2] ** 2,
+                             2 * h[:, 0] * h[:, 1], 2 * h[:, 0] * h[:, 2],
+                             2 * h[:, 1] * h[:, 2]])
+        # small ridge on the quadratic terms keeps B tame on thin shells
+        ridge = np.zeros((7, 7))
+        ridge[1:, 1:] = np.eye(6) * 1e-6 * len(h)
+        coef = np.linalg.solve(A.T @ A + ridge, A.T @ y)
+        return coef
+
+    def _aniso_factor(self, coef):
+        """exp(-(c + h^T B h)) per reflection, capped to [0.5, 2]."""
+        h = self.hkl.astype(np.float64)
+        quad = (coef[1] * h[:, 0] ** 2 + coef[2] * h[:, 1] ** 2
+                + coef[3] * h[:, 2] ** 2 + coef[4] * 2 * h[:, 0] * h[:, 1]
+                + coef[5] * 2 * h[:, 0] * h[:, 2] + coef[6] * 2 * h[:, 1] * h[:, 2])
+        lnfac = -(coef[0] + quad)
+        return np.exp(np.clip(lnfac, -np.log(2.0), np.log(2.0)))
+
     # ------------------------------------------------------------------
     def run(self):
         cfg = self.cfg
@@ -272,15 +329,70 @@ class DensityModifierV2(DensityModifier):
         prev_score = None
         plateau = 0
         free_scored = False
+        self._Fo_raw = self.Fo.copy()       # anisotropic correction is always
+                                            # applied to the RAW amplitudes
+        # --- optional anisotropic scaling of Fo (once; data-only estimate) --
+        self._aniso = None
+        if cfg.aniso:
+            coef = self._fit_aniso()
+            if coef is not None:
+                fac = self._aniso_factor(coef)
+                meas = np.isfinite(self._Fo_raw) & (self._Fo_raw > 0)
+                self.Fo = np.where(meas, self._Fo_raw * fac, self.Fo)
+                self._aniso = dict(B=[float(x) for x in coef],
+                                   fac_min=float(fac[meas].min()),
+                                   fac_max=float(fac[meas].max()))
+                self.log(f'[v2  ] anisotropic correction: B_diag='
+                         f'{coef[1]:+.3g} {coef[2]:+.3g} {coef[3]:+.3g}; '
+                         f'Fo rescaled by {self._aniso["fac_min"]:.2f}-'
+                         f'{self._aniso["fac_max"]:.2f} (capped at 0.5-2.0)')
+            else:
+                self.log('[v2  ] anisotropic correction: too few work '
+                         'reflections; skipped')
+
+        # --- phase extension: unphased amplitudes activate progressively ----
+        ext_work = self.ext & ~self.free
+        n_ext = int(ext_work.sum())
+        ext_act = np.zeros(self.nref, dtype=bool)
+        ext_order = None
+        n_on_prev = 0
+        if n_ext:
+            if cfg.extend:
+                order = np.argsort(-self.d[ext_work])     # coarse shells first
+                ext_order = np.nonzero(ext_work)[0][order]
+                self.log(f'[v2  ] phase extension: {n_ext} reflections have Fo '
+                         f'but no starting phase (d '
+                         f'{np.nanmin(self.d[ext_work]):.2f}-'
+                         f'{np.nanmax(self.d[ext_work]):.2f} A); activating the '
+                         f'coarsest {100 // max(cfg.ext_steps, 1)}% per cycle '
+                         f'over {cfg.ext_steps} cycles')
+            else:
+                self.log(f'[v2  ] {n_ext} unphased amplitudes present; phase '
+                         f'extension disabled (--no-extend)')
 
         self.log('')
         self.log(f'{"cyc":>3} {"meanFOM":>8} {"freeCC":>7} {"freeR":>7} '
                  f'{"SigmaQ":>9} {"gamma":>7} {"dPhi":>7} {"mapCC":>7} {"best":>5}')
         for cyc in range(1, ncycles + 1):
+            # --- phase-extension activation (coarse shells first) ----------
+            if ext_order is not None:
+                n_on = min(int(round(n_ext * min(1.0, cyc / max(cfg.ext_steps, 1)))),
+                           n_ext)
+                if n_on > n_on_prev:
+                    ext_act[:] = False
+                    ext_act[ext_order[:n_on]] = True
+                    self.log(f'[v2  ] cycle {cyc}: activated {n_on - n_on_prev} '
+                             f'more extension reflections ({n_on}/{n_ext} total, '
+                             f'down to {self.d[ext_order[n_on - 1]]:.2f} A)')
+                    n_on_prev = n_on
+            active = self.valid | ext_act
+            self._active = active
+            Fo = np.nan_to_num(self.Fo)     # refreshed: aniso may rescale Fo
+
             phi_best_rad, m_best = hl_centroid(HL_cur)
             phi_best_rad = self._project_centric(phi_best_rad)
             phi_deg = np.rad2deg(phi_best_rad)
-            F_best = np.where(self.valid, m_best * Fo, 0.0)
+            F_best = np.where(active, m_best * Fo, 0.0)
             F_omit = F_best.copy()
             F_omit[self.free] = 0.0
 
@@ -318,7 +430,7 @@ class DensityModifierV2(DensityModifier):
             HL_mod = np.column_stack([wgt * X * np.cos(phi_mod),
                                       wgt * X * np.sin(phi_mod),
                                       np.zeros(self.nref), np.zeros(self.nref)])
-            HL_mod = np.where(self.valid[:, None], HL_mod, 0.0)
+            HL_mod = np.where(active[:, None], HL_mod, 0.0)
             if cfg.anchor == 'exp':
                 HL_new = HL_exp + HL_mod      # anchored to the ORIGINAL experiment
             else:
@@ -339,6 +451,8 @@ class DensityModifierV2(DensityModifier):
             score = free_cc if cfg.free_metric == 'cc' else -free_r
             snapshot = dict(HL=HL_new.copy(), phi=phi_new_rad.copy(), m=m_new.copy(),
                             Fmod=Fmod.copy(), Dg=Dg, Ds=np.array(Ds, copy=True),
+                            Qs=np.array(Qs, copy=True),
+                            X=X.copy(), ext_act=ext_act.copy(),
                             score=score, cycle=cyc)
             if not np.isfinite(score):
                 # No usable free set: the early-stop criterion does not exist.
@@ -371,6 +485,10 @@ class DensityModifierV2(DensityModifier):
                 prev_score = score
 
             stats.append(dict(cycle=cyc, mean_fom=float(np.mean(m_new[sel])),
+                              mean_fom_ext=(float(np.mean(m_new[ext_act]))
+                                            if np.any(ext_act) else None),
+                              n_ext_active=int(ext_act.sum()),
+                              aniso=self._aniso,
                               free_cc=free_cc, free_r_omit=free_r,
                               sigmaq_median=qmed, gamma=gamma, d_eff=d_eff,
                               mask_radius=radius,
@@ -386,7 +504,9 @@ class DensityModifierV2(DensityModifier):
                      f'{(gamma if gamma is not None else float("nan")):7.3f} '
                      f'{dphi:7.2f} {map_cc:7.4f} {"*" if is_best else " ":>5}')
 
-            if cfg.auto_stop and cyc >= cfg.min_cycles and plateau >= cfg.patience:
+            ext_done = (ext_order is None) or (int(ext_act.sum()) >= n_ext)
+            if (cfg.auto_stop and cyc >= cfg.min_cycles and plateau >= cfg.patience
+                    and ext_done):
                 self.log(f'[v2  ] early stop at cycle {cyc}: free-set '
                          f'{cfg.free_metric} improved by less than '
                          f'{cfg.min_improve} for {plateau} cycles; '
@@ -402,10 +522,46 @@ class DensityModifierV2(DensityModifier):
         self.D_shell = best['Ds']
         self.stats = stats
         self.best_cycle = best['cycle']
+        self.ext_activated = best['ext_act']
+        # Extension reflections that never activated (the free set, or cycles
+        # ran out): phase and FOM from the best map's own prediction.
+        miss = self.ext & ~best['ext_act'] if cfg.extend else np.zeros(0, bool)
+        if np.any(miss):
+            phi_map = self._project_centric(np.angle(best['Fmod']))
+            # X was only ever computed for active reflections; rebuild it for
+            # the never-activated ones from the best cycle's shell D / SigmaQ
+            Ds = np.asarray(best['Ds'])
+            Qs = np.asarray(best['Qs'])
+            sh = np.clip(self.shell[miss], 0, cfg.n_shells - 1)
+            Fc_m = np.abs(best['Fmod'][miss])
+            Fo_m = np.nan_to_num(self.Fo[miss])
+            x = np.clip(cfg.cmbwt * 2.0 * Fo_m * Ds[sh] * Fc_m / Qs[sh],
+                        0.0, cfg.x_max)
+            self.best_phi_rad[miss] = phi_map[miss]
+            self.best_m[miss] = np.clip(x_to_fom(x), 0.0, 1.0)
+            HLx = np.zeros((int(miss.sum()), 4))
+            HLx[:, 0] = x * np.cos(phi_map[miss])
+            HLx[:, 1] = x * np.sin(phi_map[miss])
+            self.HL_final[miss] = HLx
         self.elapsed = time.time() - t0
         self._write_output()
         self._write_stats()
         return self.stats
+
+    def _write_output(self):
+        # Extension reflections carry a measured Fo and now a phase, so they
+        # must be written like any other reflection (FDM = Fo, filled
+        # PHIDM/FOMDM) instead of falling through v1's "no data" branch.
+        # With extension disabled, v1's behaviour is kept untouched.
+        if self.cfg.extend and np.any(self.ext):
+            orig = self.valid
+            self.valid = self.valid | self.ext
+            try:
+                super()._write_output()
+            finally:
+                self.valid = orig
+        else:
+            super()._write_output()
 
     def _write_stats(self):
         # add v2-specific fields to the parent JSON payload
@@ -420,6 +576,9 @@ class DensityModifierV2(DensityModifier):
                                      sigmaq_source=self.cfg.sigmaq_source,
                                      auto_stop=self.cfg.auto_stop,
                                      early_stop_available=self.early_stop_available,
+                                     n_ext=int(np.sum(self.ext)),
+                                     n_ext_activated=int(np.sum(self.ext_activated)),
+                                     aniso=self.cfg.aniso,
                                      best_free_cc=max(
                                          (s['free_cc'] for s in self.stats
                                           if np.isfinite(s['free_cc'])),
@@ -446,6 +605,17 @@ def build_parser_v2():
                         'attempt)')
     p.add_argument('--kfold', type=int, default=5,
                    help='number of k-fold omit maps per cycle (kfold mode)')
+    p.add_argument('--no-extend', dest='extend', action='store_false',
+                   default=True,
+                   help='disable phase extension of reflections that have Fo '
+                        'but no starting phase (NaN PHIB/FOM); by default they '
+                        'are activated progressively, coarse shells first')
+    p.add_argument('--ext-steps', type=int, default=5,
+                   help='cycles over which extension reflections activate')
+    p.add_argument('--aniso', action='store_true', default=False,
+                   help='per-cycle anisotropic scaling of Fo towards |Fmod| '
+                        '(6-parameter fit; the corrected amplitudes are used '
+                        'internally and written to FDM)')
     p.add_argument('--auto-stop', action='store_true', default=True)
     p.add_argument('--no-auto-stop', dest='auto_stop', action='store_false',
                    help='disable free-set early stopping (fixed --cycles)')
@@ -494,7 +664,9 @@ def main(argv=None):
                    patience=args.patience, free_metric=args.free_metric,
                    min_free=args.min_free, min_improve=args.min_improve,
                    omit_fc=args.omit_fc, hist_mode=args.hist_mode,
-                   per_shell_d=args.per_shell_d, kfold=args.kfold)
+                   per_shell_d=args.per_shell_d, kfold=args.kfold,
+                   extend=args.extend, ext_steps=args.ext_steps,
+                   aniso=args.aniso)
     DensityModifierV2(cfg).run()
     return 0
 
