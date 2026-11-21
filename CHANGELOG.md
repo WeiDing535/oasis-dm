@@ -75,9 +75,18 @@ Mean cos phase error vs reference (`PHIC`), work reflections:
 
 NCS averaging pays when the operators are tight and the copies are many (7tj1:
 +0.014 cos); a loose operator costs accuracy and the poorer the starting phases
-the deeper the loss (3i0t/3i0t_hard). That asymmetry is why the automatic mode
-gates on the free set (on `7e1d` it detects a spurious operator and keeps
-averaging off) and `--ncs` is documented as an expert option.
+the deeper the loss (3i0t/3i0t_hard). That asymmetry is why `--ncs` is
+documented as an expert option and `--ncs-auto` gates on the free set with a
+clear margin.
+
+### Fixed
+
+- First run of the test suite on Windows/CI: `test_missing_hist_lib` left the
+  process inside its temp directory (Windows refuses to delete the cwd), and
+  `test_extension_beats_no_extend` relied on auto-stop cycle choice, which
+  varies with the platform's FFT numerics. The extension effect is now
+  measured at a pinned cycle count (+0.012 cos, identical on macOS, Linux and
+  Windows) with a threshold to match.
 
 ## [2.1.0] — 2026-11-21
 

@@ -75,16 +75,22 @@ def test_missing_hist_lib_is_reported_clearly():
     try:
         with tempfile.TemporaryDirectory() as tmp:
             os.chdir(tmp)
-            # the package ships a fallback library; pretend it is absent to test
-            # the "nothing found" path
-            paths.bundled_path = lambda: Path(tmp) / "nope.lib"
-            with raises(ValueError, match="hist.lib"):
-                paths.resolve_hist_lib()
-            with raises(ValueError, match="not a file"):
-                paths.resolve_hist_lib("/nonexistent/hist.lib")
-            # and with the fallback in place it resolves without any CCP4 install
-            paths.bundled_path = real_bundled
-            assert Path(paths.resolve_hist_lib()).is_file()
+            try:
+                # the package ships a fallback library; pretend it is absent
+                # to test the "nothing found" path
+                paths.bundled_path = lambda: Path(tmp) / "nope.lib"
+                with raises(ValueError, match="hist.lib"):
+                    paths.resolve_hist_lib()
+                with raises(ValueError, match="not a file"):
+                    paths.resolve_hist_lib("/nonexistent/hist.lib")
+                # and with the fallback in place it resolves without any
+                # CCP4 install
+                paths.bundled_path = real_bundled
+                assert Path(paths.resolve_hist_lib()).is_file()
+            finally:
+                # restore before the temp dir is cleaned up: Windows refuses
+                # to delete the process's current working directory
+                os.chdir(cwd)
     finally:
         paths.bundled_path = real_bundled
         os.chdir(cwd)
