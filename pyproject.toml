@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oasis-dm"
+version = "2.0.0"
+description = "In-house density modification (phase improvement) for macromolecular crystallography"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Wei Ding" }]
+keywords = ["crystallography", "density modification", "phase improvement", "SAD", "MTZ"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Intended Audience :: Science/Research",
+]
+dependencies = [
+  "gemmi>=0.6",
+  "numpy>=1.22",
+  "scipy>=1.8",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.5"]
+test = ["pytest>=7"]
+
+[project.scripts]
+oasis-dm = "oasis_dm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/WeiDing535/oasis-dm"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
