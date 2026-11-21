@@ -1,0 +1,56 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Unit and smoke tests (no CCP4, no hist.lib)
+        run: python -m pytest tests -q
+
+      - name: Console script works
+        run: |
+          oasis-dm --version
+          oasis-dm --help > /dev/null
+
+      - name: End-to-end run on a bundled case
+        shell: bash
+        run: |
+          oasis-dm --mtzin tests/data/7e1d.mtz --mtzout out/ci.mtz \
+                   --stats out/ci.json --no-auto-stop --cycles 2 --quiet
+          python - <<'EOF'
+          import gemmi
+          m = gemmi.read_mtz_file("out/ci.mtz")
+          labels = set(m.column_labels())
+          need = {"DM_FDM", "DM_PHIDM", "DM_FOMDM", "DM_FWT", "DM_PHWT"}
+          missing = need - labels
+          assert not missing, missing
+          print("columns ok:", sorted(need))
+          EOF

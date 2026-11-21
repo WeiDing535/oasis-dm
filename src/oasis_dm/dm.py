@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""oasis_dm v2 -- unbiased phase recombination by reflection-omit error estimation
-and free-set driven early stopping.
+"""oasis_dm v2 -- the engine the CLI runs: cross-validated map + free-set stopping.
 
 Why v2 exists
 -------------
 In v1 the Sim/sigmaA missing-structure variance SigmaQ was fitted on WORK
-reflections, i.e. exactly those reflections that were used to compute the map.
-That makes (Fo - D*Fcalc) systematically too small, X too large, and the DM
-phases over-trusted (FOM inflation).  v1 patched this with a hand-tuned
-cmbwt=0.4 obtained from a 3-case sweep -- a constant that need not generalise.
+reflections, i.e. exactly those reflections used to compute the map.  That makes
+(Fo - D*Fc) systematically too small, X too large, and the modified phases
+over-trusted (FOM inflation).  v2 adds the two things that can be checked without
+reference phases:
 
-v2 follows the idea of CCP4 dm COMBINE OMIT / Parrot's free likelihood:
-  * each cycle builds TWO maps from the SAME mask and histogram LUT:
-      rho_full  -- all reflections (used for the output phases)
-      rho_omit  -- free reflections deleted (unbiased cross-validation map)
-  * SigmaQ and the shell scale D are fitted ONLY on the omitted reflections
-    (Fo_free vs |Fmod_omit|_free), so the weight X no longer contains the
-    self-reference bias; cmbwt can go back to 1.0.
-  * a free-set figure of merit (amplitude CC) drives early stopping and the
-    best cycle is restored (dm NCYCLE AUTO / RESTORE idea).
+  * a second map per cycle built from the SAME mask and histogram LUT with the
+    free reflections deleted, which gives a free-set amplitude CC / R (the dm
+    COMBINE OMIT idea).  It is a *diagnostic*: the omit map still contains ~95% of
+    the reflections, so its amplitude agreement is not an unbiased phase-error
+    estimate, and `sigmaq_source='omit'` is consequently not the default.
+  * free-set driven stopping: an absolute-tolerance plateau test with arg-max
+    restore (dm NCYCLE AUTO / RESTORE idea).
 
-Everything else (solvent mask, histogram matching, gamma correction, HL
-recombination, output columns) is inherited unchanged from v1.  v1 is NOT
-modified.  This program never calls dm or cparrot.
+Measured on the bundled cases: the free-set CC creeps up ~0.005 per cycle for as
+long as you let it run, so a strict "no improvement" test never fires; an absolute
+tolerance is required.  True phase error is flat from cycle 4-6 onwards.
+
+Solvent masking, histogram matching, gamma correction, HL recombination and the
+output columns are shared with v1 through ``core.DensityModifier``.  This program
+never calls dm or cparrot.
 """
 from __future__ import annotations
 
@@ -34,7 +35,6 @@ import time
 from dataclasses import dataclass, asdict
 
 import numpy as np
-from scipy import ndimage
 
 try:
     from . import __version__
@@ -49,13 +49,16 @@ class ConfigV2(Config):
                                     # 'omit' (unbiased attempt, needs scale
                                     # correction to be stable) | 'work'
     auto_stop: bool = True
-    max_cycles: int = 12
+    max_cycles: int = 8
     min_cycles: int = 2
     patience: int = 2
+    min_improve: float = 0.02       # free-set score gain that counts as progress
     free_metric: str = 'cc'         # 'cc' | 'rfree'
     min_free: float = 500.0         # below this many valid free reflections even
                                     # an explicit 'omit' request falls back to
                                     # blend (work-dominated SigmaQ)
+    omit_fc: str = 'full'           # 'full' | 'omit': which |Fmod| predicts the
+                                    # omitted reflections in the SigmaQ fit
     cmbwt: float = 0.4              # v1-calibrated damping; kept conservative
                                     # because the simplified omit SigmaQ estimate
                                     # is optimistic (free set is only ~5% of
@@ -91,50 +94,6 @@ class DensityModifierV2(DensityModifier):
                  f'free reflections={self.n_free_valid}')
 
     # ------------------------------------------------------------------
-    def _build_modifier(self, rho, radius, mean_fom_now):
-        """Build a FIXED mask + histogram LUT from rho; return a callable that
-        applies the same modification to any (full or omit) density map."""
-        cfg = self.cfg
-        av = self._mask_feature(rho, radius)
-        cut = float(np.quantile(av, cfg.solc))
-        width = max(0.10 * float(av.std()), 1e-9)
-        mask_solv = 1.0 / (1.0 + np.exp(np.clip((av - cut) / width, -30, 30)))
-        if cfg.mask_smooth > 0:
-            mask_solv = ndimage.gaussian_filter(mask_solv, cfg.mask_smooth)
-        mask_prot = 1.0 - mask_solv
-
-        d_eff = float(np.clip(self.dmin / max(mean_fom_now, 0.30) ** 0.25, 1.5, 10.0))
-        if cfg.hist_on:
-            cdf_t, tgt_mean, tgt_std = self.hist.target(d_eff)
-            vals = rho[mask_prot > 0.5]
-            if len(vals) < 100:
-                vals = rho.ravel()
-            svals = np.sort(vals)
-            qq = np.linspace(0.0, 1.0, len(svals))
-            cur_mean, cur_std = float(vals.mean()), max(float(vals.std()), 1e-6)
-
-            def hist_map(x):
-                r = np.interp(x, svals, qq)
-                if cfg.squash:
-                    z = 2.0 * r - 1.0
-                    z = z / np.sqrt(1.0 + 0.01 * z * z)
-                    r = (z + 1.0) / 2.0
-                hm = np.interp(r, cdf_t, self.hist.rho_axis)
-                return (hm - tgt_mean) / tgt_std * cur_std + cur_mean
-        else:
-            def hist_map(x):
-                return x
-
-        wp = mask_prot if cfg.hist_on else np.zeros_like(mask_prot)
-        ws = mask_solv if cfg.solv_on else np.zeros_like(mask_solv)
-        wo = (1.0 - wp) * (1.0 - ws)
-        sw = np.maximum(wp + ws + wo, 1e-6)
-
-        def modify(x):
-            return (wp * hist_map(x) + ws * self.rho_solv + wo * x) / sw
-
-        return modify, mask_solv, mask_prot, d_eff
-
     def _estimate_gamma(self, rho, modify):
         rng = np.random.default_rng(self.cfg.seed + 9000 + len(self.stats))
         eps = 0.03 * max(float(rho.std()), 1e-6)
@@ -160,14 +119,12 @@ class DensityModifierV2(DensityModifier):
             # work-dominated, free reflections only help the per-shell counts
             fitmask = self.work | self.free_valid
             fc_fit = Fc_full
-        else:  # 'omit' (unbiased): fit on FREE reflections, but take Fc from the
-               # FULL map.  A free reflection's contribution to the full density
-               # is diluted across the whole grid, so Fc_full[free] is ~self-
-               # reference free; using Fc_omit would shrink |Fmod| (incomplete
-               # map) and systematically *under*-estimate SigmaQ -> FOM inflation
-               # (the symmetric failure mode to v1's work self-reference bias).
+        else:  # 'omit' (unbiased): fit on FREE reflections.  Fc may come from the
+               # full map ('full') or from the map that never saw them ('omit').
+               # The omit variant is the physically consistent one: a real unknown
+               # reflection is absent from the map that predicts it.
             fitmask = self.free_valid
-            fc_fit = Fc_full
+            fc_fit = Fc_omit if cfg.omit_fc == 'omit' else Fc_full
         for s in range(cfg.n_shells):
             idx = (fitmask & (self.shell == s) & np.isfinite(fc_fit)
                    & (fc_fit > 0) & (Fo > 0))
@@ -219,7 +176,8 @@ class DensityModifierV2(DensityModifier):
         t0 = time.time()
         ncycles = cfg.max_cycles if cfg.auto_stop else cfg.cycles
         best = None
-        bad_streak = 0
+        prev_score = None
+        plateau = 0
         free_scored = False
 
         self.log('')
@@ -260,12 +218,16 @@ class DensityModifierV2(DensityModifier):
 
             # --- unbiased error estimate + phase recombination ------------
             X, Ds, Qs, Dg = self._sim_weight_v2(Fc_full, Fc_omit)
+            wgt = cfg.cmbwt
             phi_mod = np.angle(Fmod)
-            HL_mod = np.column_stack([cfg.cmbwt * X * np.cos(phi_mod),
-                                      cfg.cmbwt * X * np.sin(phi_mod),
+            HL_mod = np.column_stack([wgt * X * np.cos(phi_mod),
+                                      wgt * X * np.sin(phi_mod),
                                       np.zeros(self.nref), np.zeros(self.nref)])
             HL_mod = np.where(self.valid[:, None], HL_mod, 0.0)
-            HL_new = HL_exp + HL_mod
+            if cfg.anchor == 'exp':
+                HL_new = HL_exp + HL_mod      # anchored to the ORIGINAL experiment
+            else:
+                HL_new = HL_cur + HL_mod      # cumulative (faster, more model bias)
             phi_new_rad, m_new = hl_centroid(HL_new)
             phi_new_rad = self._project_centric(phi_new_rad)
             HL_cur = HL_new
@@ -277,10 +239,12 @@ class DensityModifierV2(DensityModifier):
             map_cc = (float(np.corrcoef(rho_mod.ravel(), rho_prev.ravel())[0, 1])
                       if rho_prev is not None else float('nan'))
             rho_prev = rho_mod
-            qmed = float(np.median(Qs[np.isfinite(Qs) & (Qs > 0)]))
+            qmed_vals = Qs[np.isfinite(Qs) & (Qs > 0)]
+            qmed = float(np.median(qmed_vals)) if qmed_vals.size else float('nan')
             score = free_cc if cfg.free_metric == 'cc' else -free_r
             snapshot = dict(HL=HL_new.copy(), phi=phi_new_rad.copy(), m=m_new.copy(),
-                            Fmod=Fmod.copy(), Dg=Dg, score=score, cycle=cyc)
+                            Fmod=Fmod.copy(), Dg=Dg, Ds=np.array(Ds, copy=True),
+                            score=score, cycle=cyc)
             if not np.isfinite(score):
                 # No usable free set: the early-stop criterion does not exist.
                 # Stopping here would freeze the very first cycle, which is the
@@ -293,16 +257,23 @@ class DensityModifierV2(DensityModifier):
                              'count and keeping the final iterate')
                     free_scored = True
                 best = snapshot
-                bad_streak = 0
                 is_best = True
-            elif best is None or (np.isfinite(score) and score > best['score'] + 1e-5):
+            elif best is None or score > best['score']:
                 self.early_stop_available = True
                 best = snapshot
-                bad_streak = 0
                 is_best = True
             else:
-                bad_streak += 1
                 is_best = False
+            # Plateau test on the free-set score itself.  An absolute tolerance
+            # is essential: the free-set CC of a density-modified map creeps up
+            # by ~0.005 per cycle forever, so a strict "no improvement" test
+            # never fires and the run always burns max_cycles.
+            if np.isfinite(score):
+                if prev_score is not None and score - prev_score < cfg.min_improve:
+                    plateau += 1
+                elif prev_score is not None:
+                    plateau = 0
+                prev_score = score
 
             stats.append(dict(cycle=cyc, mean_fom=float(np.mean(m_new[sel])),
                               free_cc=free_cc, free_r_omit=free_r,
@@ -320,9 +291,10 @@ class DensityModifierV2(DensityModifier):
                      f'{(gamma if gamma is not None else float("nan")):7.3f} '
                      f'{dphi:7.2f} {map_cc:7.4f} {"*" if is_best else " ":>5}')
 
-            if cfg.auto_stop and cyc >= cfg.min_cycles and bad_streak >= cfg.patience:
+            if cfg.auto_stop and cyc >= cfg.min_cycles and plateau >= cfg.patience:
                 self.log(f'[v2  ] early stop at cycle {cyc}: free-set '
-                         f'{cfg.free_metric} did not improve for {bad_streak} cycles; '
+                         f'{cfg.free_metric} improved by less than '
+                         f'{cfg.min_improve} for {plateau} cycles; '
                          f'restoring cycle {best["cycle"]}')
                 break
 
@@ -332,6 +304,7 @@ class DensityModifierV2(DensityModifier):
         self.HL_final = best['HL']
         self.Fmod = best['Fmod']
         self.Dg = best['Dg']
+        self.D_shell = best['Ds']
         self.stats = stats
         self.best_cycle = best['cycle']
         self.elapsed = time.time() - t0
@@ -374,10 +347,19 @@ def build_parser_v2():
     p.add_argument('--auto-stop', action='store_true', default=True)
     p.add_argument('--no-auto-stop', dest='auto_stop', action='store_false',
                    help='disable free-set early stopping (fixed --cycles)')
-    p.add_argument('--max-cycles', type=int, default=12)
+    p.add_argument('--max-cycles', type=int, default=8)
     p.add_argument('--min-cycles', type=int, default=2)
     p.add_argument('--patience', type=int, default=2)
     p.add_argument('--free-metric', choices=['cc', 'rfree'], default='cc')
+    p.add_argument('--hist-mode', choices=['cell', 'protein'], default='cell',
+                   help='histogram target: whole-cell hist.lib distribution or the '
+                        'protein-only part of it (default cell)')
+    p.add_argument('--per-shell-d', action='store_true',
+                   help='use the per-resolution-shell sigma_A in FWT/FDM output')
+    p.add_argument('--omit-fc', choices=['full', 'omit'], default='full',
+                   help='which |Fmod| predicts omitted reflections in the SigmaQ fit')
+    p.add_argument('--min-improve', type=float, default=0.02,
+                   help='free-set score gain that counts as progress (plateau test)')
     p.add_argument('--min-free', type=float, default=500.0,
                    help='below this many valid free reflections, auto-fallback '
                         'SigmaQ to blend (work-dominated) + cmbwt 0.4')
@@ -407,7 +389,9 @@ def main(argv=None):
                    sigmaq_source=args.sigmaq_source, auto_stop=args.auto_stop,
                    max_cycles=args.max_cycles, min_cycles=args.min_cycles,
                    patience=args.patience, free_metric=args.free_metric,
-                   min_free=args.min_free)
+                   min_free=args.min_free, min_improve=args.min_improve,
+                   omit_fc=args.omit_fc, hist_mode=args.hist_mode,
+                   per_shell_d=args.per_shell_d)
     DensityModifierV2(cfg).run()
     return 0
 

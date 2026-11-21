@@ -67,18 +67,26 @@ def test_runs_without_a_histogram_library():
 
 def test_missing_hist_lib_is_reported_clearly():
     sys.path.insert(0, str(ROOT / "src"))
-    from oasis_dm.paths import resolve_hist_lib
+    import oasis_dm.paths as paths
 
     saved = {k: os.environ.pop(k, None) for k in ("OASIS_DM_HIST_LIB", "CLIBD")}
     cwd = os.getcwd()
+    real_bundled = paths.bundled_path
     try:
         with tempfile.TemporaryDirectory() as tmp:
             os.chdir(tmp)
+            # the package ships a fallback library; pretend it is absent to test
+            # the "nothing found" path
+            paths.bundled_path = lambda: Path(tmp) / "nope.lib"
             with raises(ValueError, match="hist.lib"):
-                resolve_hist_lib()
+                paths.resolve_hist_lib()
             with raises(ValueError, match="not a file"):
-                resolve_hist_lib("/nonexistent/hist.lib")
+                paths.resolve_hist_lib("/nonexistent/hist.lib")
+            # and with the fallback in place it resolves without any CCP4 install
+            paths.bundled_path = real_bundled
+            assert Path(paths.resolve_hist_lib()).is_file()
     finally:
+        paths.bundled_path = real_bundled
         os.chdir(cwd)
         for key, value in saved.items():
             if value is not None:

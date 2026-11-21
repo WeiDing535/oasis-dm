@@ -15,21 +15,25 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 
 def main():
-    import test_cli
+    import importlib
 
-    names = sorted(n for n in dir(test_cli) if n.startswith("test_"))
-    failures = []
-    for name in names:
-        fn = getattr(test_cli, name)
-        if not callable(fn):
-            continue
-        try:
-            fn()
-            print("PASS %s" % name)
-        except Exception:  # noqa: BLE001
-            failures.append(name)
-            print("FAIL %s" % name)
-            traceback.print_exc()
+    modules = sorted(p.stem for p in (ROOT / "tests").glob("test_*.py"))
+    names, failures = [], []
+    for mod_name in modules:
+        mod = importlib.import_module(mod_name)
+        for name in sorted(n for n in dir(mod) if n.startswith("test_")):
+            fn = getattr(mod, name)
+            if not callable(fn):
+                continue
+            label = "%s.%s" % (mod_name, name)
+            names.append(label)
+            try:
+                fn()
+                print("PASS %s" % label)
+            except Exception:  # noqa: BLE001
+                failures.append(label)
+                print("FAIL %s" % label)
+                traceback.print_exc()
     print("\n%d/%d passed" % (len(names) - len(failures), len(names)))
     return 1 if failures else 0
 

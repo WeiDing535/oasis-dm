@@ -165,21 +165,55 @@ class HistLib:
         self.rho_axis = self.rmin + (np.arange(self.nbin) + 0.5) * \
                         (self.rmax - self.rmin) / self.nbin
 
-    def target(self, d_eff):
-        """interpolate the target PDF at effective resolution d_eff (A)."""
+    def _pdf(self, d_eff):
         d = float(np.clip(d_eff, self._res_asc[0], self._res_asc[-1]))
-        pdf = np.array([np.interp(d, self._res_asc, self._data_asc[j])
-                        for j in range(self.nbin)], dtype=np.float64)
+        # linear blend between the two bracketing resolution columns; equivalent
+        # to nbin np.interp calls but done once
+        i = int(np.clip(np.searchsorted(self._res_asc, d) - 1, 0, self.nres - 2))
+        x0, x1 = self._res_asc[i], self._res_asc[i + 1]
+        t = (d - x0) / (x1 - x0) if x1 != x0 else 0.0
+        pdf = (1.0 - t) * self._data_asc[:, i] + t * self._data_asc[:, i + 1]
         pdf = np.maximum(pdf, 0.0)
         tot = pdf.sum()
         if tot <= 0:
             raise ValueError('empty target histogram')
-        pdf /= tot
+        return pdf / tot
+
+    def target(self, d_eff):
+        """interpolate the whole-cell target PDF at effective resolution d_eff (A)."""
+        pdf = self._pdf(d_eff)
         cdf = np.cumsum(pdf)
         cdf[-1] = 1.0
         mean = float((self.rho_axis * pdf).sum())
         std = float(np.sqrt(((self.rho_axis - mean) ** 2 * pdf).sum()))
         return cdf, mean, max(std, 1e-6)
+
+    def protein_target(self, d_eff, solc):
+        """target PDF restricted to the PROTEIN part of the cell.
+
+        ``hist.lib`` describes the density distribution of the *whole* unit cell,
+        which is dominated by the solvent peak (at 2.5 A roughly 55-60% of the
+        cell sits below 0.4 e/A^3).  Histogram matching is applied to the
+        protein region only, so the target must be conditioned the same way:
+        take the upper ``solc`` fraction of the cell distribution and renormalise.
+        Mapping protein ranks onto the unconditioned cell CDF instead pushes a
+        solvent-shaped low-density tail into the protein and flattens contrast.
+        """
+        pdf = self._pdf(d_eff)
+        cdf_cell = np.cumsum(pdf)
+        rho_cut = float(np.interp(1.0 - float(np.clip(solc, 0.05, 0.95)),
+                                  cdf_cell, self.rho_axis))
+        keep = self.rho_axis >= rho_cut
+        if keep.sum() < 4:
+            return self.target(d_eff)
+        sub_pdf = pdf[keep]
+        sub_pdf = sub_pdf / sub_pdf.sum()
+        axis = self.rho_axis[keep]
+        cdf = np.cumsum(sub_pdf)
+        cdf[-1] = 1.0
+        mean = float((axis * sub_pdf).sum())
+        std = float(np.sqrt(((axis - mean) ** 2 * sub_pdf).sum()))
+        return cdf, mean, max(std, 1e-6), axis, rho_cut
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +242,10 @@ class Config:
     mask_smooth: float = 0.8     # gaussian smoothing sigma (grid points)
     hist_lib: str = ''          # resolved by paths.resolve_hist_lib()
     hist_on: bool = True
+    hist_mode: str = 'cell'      # 'protein' = target conditioned on the protein
+                                 # volume fraction (consistent with matching the
+                                 # protein region); 'cell' = whole-cell target
+    per_shell_d: bool = False    # use per-shell sigma_A D in FWT/FDM output
     solv_on: bool = True
     squash: bool = True          # Parrot's mild non-linear ordinal squash
     gamma_on: bool = True        # perturbation-gamma bias correction
@@ -413,6 +451,82 @@ class DensityModifier:
         return g[self.ih, self.ik, self.il]
 
     # ---------------------- solvent envelope -------------------------------
+    def _build_modifier(self, rho, radius, mean_fom_now):
+        """Build a FIXED mask + histogram LUT from ``rho``.
+
+        Returns ``(modify, mask_solv, mask_prot, d_eff)`` where ``modify`` applies
+        the same modification to any density map.  Keeping the mask and the LUT
+        fixed is what makes the omit map a genuine cross-validation map (same
+        operator, independent data) instead of a different experiment.
+        """
+        cfg = self.cfg
+        av = self._mask_feature(rho, radius)
+        cut = float(np.quantile(av, cfg.solc))
+        width = max(0.10 * float(av.std()), 1e-9)
+        mask_solv = 1.0 / (1.0 + np.exp(np.clip((av - cut) / width, -30, 30)))
+        if cfg.mask_smooth > 0:
+            mask_solv = ndimage.gaussian_filter(mask_solv, cfg.mask_smooth)
+        mask_prot = 1.0 - mask_solv
+
+        d_eff = float(np.clip(self.dmin / max(mean_fom_now, 0.30) ** 0.25, 1.5, 10.0))
+        if cfg.hist_on:
+            if cfg.hist_mode == 'protein':
+                cdf_t, tgt_mean, tgt_std, rho_axis_t, _ = \
+                    self.hist.protein_target(d_eff, cfg.solc)
+            else:
+                cdf_t, tgt_mean, tgt_std = self.hist.target(d_eff)
+                rho_axis_t = self.hist.rho_axis
+            vals = rho[mask_prot > 0.5]
+            if len(vals) < 100:
+                vals = rho.ravel()
+            svals = np.sort(vals)
+            qq = np.linspace(0.0, 1.0, len(svals))
+            cur_mean, cur_std = float(vals.mean()), max(float(vals.std()), 1e-6)
+
+            # Rank mapping as a lookup table.  Two np.interp calls over the whole
+            # grid were 40% of a cycle's wall time; a uniform-bin LUT quantises
+            # the rank at 1/4096 (~6e-4 e/A^3), far below the map's own noise.
+            n_lut = 4096
+            lo, hi = float(svals[0]), float(svals[-1])
+            span = max(hi - lo, 1e-12)
+            rank_lut = np.interp(np.linspace(lo, hi, n_lut), svals, qq)
+            hm_lut = np.interp(np.linspace(0.0, 1.0, n_lut), cdf_t, rho_axis_t)
+            scale = (n_lut - 1) / span
+
+            def hist_map(x):
+                idx = np.clip(((x - lo) * scale).astype(np.int32), 0, n_lut - 1)
+                r = rank_lut[idx]
+                if cfg.squash:
+                    # Parrot/parrot-lib.cpp: mild non-linear ordinal squash
+                    z = 2.0 * r - 1.0
+                    z = z / np.sqrt(1.0 + 0.01 * z * z)
+                    r = (z + 1.0) / 2.0
+                hm = hm_lut[np.clip((r * (n_lut - 1)).astype(np.int32), 0, n_lut - 1)]
+                # re-standardise onto the CURRENT protein-region statistics
+                return (hm - tgt_mean) / tgt_std * cur_std + cur_mean
+        else:
+            def hist_map(x):
+                return x
+
+        wp = mask_prot if cfg.hist_on else np.zeros_like(mask_prot)
+        ws = mask_solv if cfg.solv_on else np.zeros_like(mask_solv)
+        wo = (1.0 - wp) * (1.0 - ws)
+        sw = np.maximum(wp + ws + wo, 1e-6)
+        # The histogram map is only needed where the protein weight is non-zero.
+        # Evaluating it on the whole grid is the single most expensive step of a
+        # cycle (two np.interp calls over ~4e5 points), and the mask is close to
+        # 0/1 almost everywhere, so restrict it to the protein support.
+        sel_prot = wp > 1e-6
+        n_prot = int(sel_prot.sum())
+
+        def modify(x):
+            out = (ws * self.rho_solv + wo * x) / sw
+            if cfg.hist_on and n_prot:
+                out[sel_prot] += wp[sel_prot] * hist_map(x[sel_prot]) / sw[sel_prot]
+            return out
+
+        return modify, mask_solv, mask_prot, d_eff
+
     def _kernel_fft(self, radius, mode):
         key = (round(radius, 3), mode)
         if key in self._kernel_cache:
@@ -524,54 +638,12 @@ class DensityModifier:
             arr = self._grid_from_coeffs(F_best, np.rad2deg(phi_best_rad))
             rho = self.rho_from_grid(arr)
 
-            # 2. solvent envelope -------------------------------------------
+            # 2. solvent envelope + target histogram + LUT ------------------
             radius = max(cfg.radius_min, cfg.radius * cfg.radius_decay ** (cyc - 1))
-            av = self._mask_feature(rho, radius)
-            cut = float(np.quantile(av, cfg.solc))
-            width = max(0.10 * float(av.std()), 1e-9)
-            mask_solv = 1.0 / (1.0 + np.exp(np.clip((av - cut) / width, -30, 30)))
-            if cfg.mask_smooth > 0:
-                mask_solv = ndimage.gaussian_filter(mask_solv, cfg.mask_smooth)
-            mask_prot = 1.0 - mask_solv
-            solv_frac = float(mask_solv.mean())
-
-            # 3. target histogram & ordinal (CDF) map ------------------------
             mean_fom_now = float(np.mean(m_best[self.valid]))
-            d_eff = float(np.clip(self.dmin / max(mean_fom_now, 0.30) ** 0.25, 1.5, 10.0))
-            rho_hm_grid = None
-            if cfg.hist_on:
-                cdf_t, tgt_mean, tgt_std = self.hist.target(d_eff)
-                vals = rho[mask_prot > 0.5]
-                if len(vals) < 100:
-                    vals = rho.ravel()
-                svals = np.sort(vals)
-                qq = np.linspace(0.0, 1.0, len(svals))
-                cur_mean = float(vals.mean())
-                cur_std = max(float(vals.std()), 1e-6)
-                rho_hm_grid = self.hist.rho_axis
-
-                def _hist_map(x):
-                    r = np.interp(x, svals, qq)
-                    if cfg.squash:
-                        # Parrot/parrot-lib.cpp: mild non-linear ordinal squash
-                        z = 2.0 * r - 1.0
-                        z = z / np.sqrt(1.0 + 0.01 * z * z)
-                        r = (z + 1.0) / 2.0
-                    hm = np.interp(r, cdf_t, rho_hm_grid)
-                    # re-standardise onto the CURRENT protein-region statistics
-                    return (hm - tgt_mean) / tgt_std * cur_std + cur_mean
-            else:
-                def _hist_map(x):
-                    return x
-
-            wp = mask_prot if cfg.hist_on else np.zeros_like(mask_prot)
-            ws = mask_solv if cfg.solv_on else np.zeros_like(mask_solv)
-            wo = (1.0 - wp) * (1.0 - ws)
-            sw = np.maximum(wp + ws + wo, 1e-6)
-
-            def modify(x):
-                return (wp * _hist_map(x) + ws * self.rho_solv + wo * x) / sw
-
+            modify, mask_solv, mask_prot, d_eff = self._build_modifier(
+                rho, radius, mean_fom_now)
+            solv_frac = float(mask_solv.mean())
             rho_mod = modify(rho)
 
             # 4. perturbation-gamma bias correction --------------------------
@@ -658,7 +730,13 @@ class DensityModifier:
         m = np.clip(self.best_m, 0.0, 1.0)
         Fc = np.abs(self.Fmod)
         phi_mod_deg = wrap180(np.rad2deg(np.angle(self.Fmod)))
-        D = self.Dg
+        # sigma_A: a single global D is a poor stand-in for a resolution-dependent
+        # one, and FWT is what model building actually consumes.
+        d_shell = getattr(self, 'D_shell', None)
+        if getattr(cfg, 'per_shell_d', False) and d_shell is not None:
+            D = np.asarray(d_shell, dtype=np.float64)[self.shell]
+        else:
+            D = np.full(self.nref, float(self.Dg))
 
         Fdm = np.where(self.valid, Fo, cfg.restore * Fc)
         Fwt = np.where(self.centric, m * Fo, 2.0 * m * Fo - D * Fc)
@@ -677,29 +755,22 @@ class DensityModifier:
             if v.shape != (self.nref,):
                 raise RuntimeError('output column shape mismatch')
 
-        out = gemmi.read_mtz_file(cfg.mtzin)
-        orig = np.asarray(out.array).copy()
-        # remove pre-existing columns with the same labels (idempotent re-runs)
+        # Rebuild the file instead of appending: re-running on an earlier output
+        # used to leave duplicate DM_* labels behind (gemmi then refuses the
+        # data block), so stale DM_* columns are dropped here by name.
+        dm_labels = {label for label, _ in OUT_COLUMNS}
+        keep = [i for i, c in enumerate(self.mtz.columns) if c.label not in dm_labels]
+        out = gemmi.Mtz(with_base=True)
+        out.spacegroup = self.sg
+        out.cell = self.cell
+        out.add_dataset('oasis_dm')
+        for i in keep[3:]:                     # H,K,L come from the base block
+            out.add_column(self.mtz.columns[i].label, self.mtz.columns[i].type)
         for label, typ in OUT_COLUMNS:
-            if out.column_with_label(label) is not None:
-                continue
             out.add_column(label, typ)
-        data = np.column_stack([orig] + [np.nan_to_num(v).astype(np.float32)
-                                         for v in newcols]).astype(np.float32)
-        if data.shape[1] != len(out.columns):
-            # gemmi add_column may not resize the existing buffer; rebuild instead
-            out = gemmi.Mtz(with_base=True)
-            out.spacegroup = self.sg
-            out.cell = self.cell
-            out.add_dataset('handdm')
-            for c in self.mtz.columns[3:]:
-                out.add_column(c.label, c.type)
-            for label, typ in OUT_COLUMNS:
-                if out.column_with_label(label) is None:
-                    out.add_column(label, typ)
-            data = np.column_stack([orig] + [np.nan_to_num(v).astype(np.float32)
-                                             for v in newcols]).astype(np.float32)
-        out.set_data(np.ascontiguousarray(data))
+        data = np.column_stack([np.asarray(self.mtz.array)[:, keep]]
+                               + [np.nan_to_num(v).astype(np.float32) for v in newcols])
+        out.set_data(np.ascontiguousarray(data.astype(np.float32)))
         out.write_to_file(cfg.mtzout)
         self.log(f'[out ] wrote {cfg.mtzout}  ({data.shape[1]} columns)')
         self.output_columns = dict(zip(

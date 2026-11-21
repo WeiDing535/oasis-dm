@@ -36,9 +36,12 @@ import tempfile
 import numpy as np
 import gemmi
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:                       # plotting is optional: scoring must work without it
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:          # noqa: BLE001
+    plt = None
 
 
 # ----------------------------------------------------------------------------
@@ -774,6 +777,10 @@ def plot_phase_error(result, prefix, colors, best):
 
 
 def write_plots(result, prefix):
+    if plt is None:
+        warn("matplotlib is not installed: skipping plots "
+             "(pip install oasis-dm[plot])")
+        return
     methods = result["methods"]
     names = list(methods.keys())
     best = None
@@ -855,8 +862,8 @@ def evaluate(args):
     write_json(result, prefix)
     write_table(result, prefix)
     write_plots(result, prefix)
-    print(f"[evaluate] 输出: {prefix}_metrics.json / _table.md / "
-          f"_wmpe_shells.png / _summary.png / _phase_error.png")
+    print(f"[evaluate] 输出: {prefix}_metrics.json / _table.md"
+          + ("" if plt is None else " / _wmpe_shells.png / _summary.png / _phase_error.png"))
     print(f"[evaluate] 警告数: {len(result['warnings'])}, 跳过方法: {len(skipped)}")
     return result
 

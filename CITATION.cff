@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use oasis_dm in published work, please cite it as below."
+title: "oasis_dm: density modification for macromolecular crystallography"
+abstract: >-
+  A self-contained density-modification (phase-improvement) engine: solvent
+  masking, histogram matching, Hendrickson-Lattman phase recombination and
+  free-set driven stopping, with no CCP4 program calls.
+authors:
+  - family-names: Ding
+    given-names: Wei
+type: software
+license: MIT
+repository-code: "https://github.com/WeiDing535/oasis-dm"
+keywords:
+  - density modification
+  - phase improvement
+  - crystallography
+  - SAD
+  - macromolecular
+version: 2.1.0
+date-released: "2026-11-21"

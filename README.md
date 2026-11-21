@@ -1,176 +1,235 @@
 # oasis_dm
 
-In-house density modification (phase improvement) for macromolecular crystallography.
+**Density modification (phase improvement) for macromolecular crystallography, without CCP4.**
+
+[![tests](https://github.com/WeiDing535/oasis-dm/actions/workflows/tests.yml/badge.svg)](https://github.com/WeiDing535/oasis-dm/actions/workflows/tests.yml)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 `oasis_dm` is a self-contained implementation of the density-modification step used in the
-[SAD / SADR pipeline](https://github.com/WeiDing535/OASIS4.3) — solvent masking, histogram
-matching, Hendrickson–Lattman phase recombination and free-set driven early stopping. It calls
-no CCP4 program and needs no CCP4 installation.
+[SAD / SADR pipeline](https://github.com/WeiDing535/OASIS4.3): solvent masking, histogram
+matching, Hendrickson–Lattman phase recombination, perturbation-γ bias correction and
+free-set driven stopping. It calls no CCP4 program and needs no CCP4 installation.
 
-> **What this is not.** `oasis_dm` is a *density modification* engine, not a phasing engine and
-> not a drop-in replacement for CCP4 `cparrot`/`parrot`. It improves phases you already have.
-> See [Known limitations](#known-limitations) before wiring it into a pipeline.
+On three bundled SAD cases it lands within a couple of degrees of CCP4 `cparrot` — see
+[Benchmark](#benchmark). It is **not** a drop-in replacement: read
+[Known limitations](#known-limitations) before wiring it into a pipeline.
 
 ---
 
 ## Install
 
 ```bash
-pip install .
-# or, for development
-pip install -e ".[test]"
+pip install .            # or: pip install -e ".[test]" for development
 ```
 
-Requires Python ≥ 3.9 and `gemmi`, `numpy`, `scipy`.
+Requires Python ≥ 3.9 and `gemmi`, `numpy`, `scipy`. A histogram library is bundled, so
+nothing else is needed to run.
 
-### The histogram library
-
-Histogram matching uses `hist.lib`, a **CCP4 data file that is not redistributed with this
-package**. Point the program at your own copy in any of these ways:
-
-```bash
-oasis-dm --hist-lib /path/to/hist.lib ...   # explicit
-export OASIS_DM_HIST_LIB=/path/to/hist.lib  # environment variable
-export CLIBD=/path/to/ccp4/lib/data        # CCP4's own lib/data directory
-```
-
-If none is found, the program says so clearly and you can run without histogram matching
-using `--no-hist` (results are worse but the run completes).
-
----
-
-## Usage
+## Quick start
 
 ```bash
 oasis-dm --mtzin input.mtz --mtzout output.mtz \
          --fo FOBS --sigf SIGFOBS --phib PHIB --fom FOM --free FreeR \
-         --solc 0.5 --cycles 5 \
-         --stats results/stats.json
-```
+         --solc 0.5
 
-`python -m oasis_dm ...` is equivalent. A quick run on a bundled case, scored against
-reference phases:
-
-```bash
+# bundled case, scored against reference phases
 ./examples/run_example.sh 7e1d
 ```
 
-### Input columns
+`python -m oasis_dm ...` is equivalent. The engine stops on its own when the free-set score
+plateaus; `--no-auto-stop --cycles N` forces a fixed number of cycles.
+
+---
+
+## Benchmark
+
+Reproduce everything below with:
+
+```bash
+python tools/benchmark.py                   # oasis_dm only, bundled histogram library
+python tools/benchmark.py --parrot          # add CCP4 cparrot (needs CCP4 on PATH)
+```
+
+Three bundled SAD cases at 2.5 Å, all with 50% solvent, all starting from the same phase
+probability. `cparrot` is run with `-solvent-flatten -histogram-match -cycles 5
+-solvent-content 0.5`, its HL coefficients converted to a centroid phase and FOM, and scored
+exactly like `oasis_dm`'s `DM_PHIDM`/`DM_FOMDM`.
+
+Weighted mean phase error (°) — lower is better:
+
+| case | input | `oasis_dm` (bundled lib) | `oasis_dm` (CCP4 `hist.lib`) | CCP4 `cparrot` |
+| --- | ---: | ---: | ---: | ---: |
+| 7e1d (P 2₁2₁2₁, 6447 refl) | 56.08 | **44.35** | 46.33 | 47.91 |
+| 6zpp (P 1 2₁ 1, 5494 refl) | 59.55 | 57.96 | 56.55 | **55.83** |
+| 3o2e (P 4₁2₁2, 2805 refl) | 58.85 | **47.64** | 49.00 | 52.37 |
+| mean | 58.16 | **49.98** | 50.63 | 52.04 |
+
+The two `oasis_dm` columns are the same code with different histogram targets: the bundled
+library (what you get on a machine without CCP4) and CCP4's own `hist.lib`. They differ by
+about a degree in each direction — neither dominates — which is why the target library is
+worth choosing deliberately.
+
+Map correlation coefficient against the reference map (bundled library / CCP4 lib / cparrot):
+
+| case | map CC |
+| --- | --- |
+| 7e1d | 0.406 → **0.629** / 0.595 / 0.569 |
+| 6zpp | 0.298 → 0.385 / 0.393 / **0.423** |
+| 3o2e | 0.437 → **0.608** / 0.586 / 0.557 |
+
+Three honest observations from that table:
+
+* **Phase accuracy is competitive**: `oasis_dm` is better on two of three cases and slightly
+  worse on one. It is not uniformly better, and three cases are not a benchmark suite.
+* **The reported FOM is optimistic.** With the bundled library it runs 0.08–0.29 above the true
+  ⟨cos Δφ⟩ (0.681 vs 0.605, 0.721 vs 0.434, 0.680 vs 0.550); `cparrot` runs 0.01–0.22 above.
+  `DM_FOMDM` is usable as a *relative* weight between reflections, not as an absolute accuracy
+  estimate — see [Known limitations](#known-limitations).
+* **The bundled histogram library is a substitute.** It happens to beat CCP4's on two of these
+  three cases and lose on the third; do not read that as a general ranking.
+
+Ablations on the same cases (weighted mean phase error °, bundled library):
+
+| configuration | 7e1d | 6zpp | 3o2e |
+| --- | ---: | ---: | ---: |
+| full engine | 44.35 | 57.96 | 47.64 |
+| without histogram matching (`--no-hist`) | 51.85 | 57.04 | 57.48 |
+| without solvent flattening (`--no-solv`) | 56.06 | 62.22 | 60.54 |
+
+Histogram matching and solvent flattening are both essential; histogram matching is the single
+largest contributor, which is why the target distribution matters (next section).
+
+---
+
+## The histogram library
+
+Histogram matching needs a resolution-dependent target distribution of protein density. CCP4
+ships one as `$CLIBD/hist.lib`; that file is **not** redistributable, so this package looks
+for a target in this order:
+
+1. `--hist-lib PATH`
+2. `$OASIS_DM_HIST_LIB`
+3. `$CLIBD/hist.lib` (CCP4's own library — preferred if you have it)
+4. the bundled `oasis_dm/data/protein_hist.lib`
+
+The bundled file is generated from public PDB entries by `tools/make_hist_lib.py`: each entry
+is reduced to amino-acid residues, structure factors are computed with real atomic scattering
+factors, truncated at each target resolution and FFTed, and the protein-volume histogram is
+averaged over entries. It is a substitute, not a copy of CCP4's curated database.
+
+```bash
+python tools/make_hist_lib.py --out src/oasis_dm/data/protein_hist.lib   # regenerate
+oasis-dm ... --no-hist        # skip histogram matching entirely
+```
+
+---
+
+## Inputs and outputs
 
 The input MTZ must contain observed amplitudes and a starting phase estimate. Column names are
-set on the command line and default to the CCP4 conventions:
+command-line options defaulting to CCP4 conventions:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--fo` | `FOBS` | observed amplitude |
 | `--sigf` | `SIGFOBS` | standard deviation of `FOBS` |
-| `--phib` | `PHIB` | starting phase, degrees |
-| `--fom` | `FOM` | starting figure of merit for `PHIB` |
-| `--hl` | `HLA,HLB,HLC,HLD` | Hendrickson–Lattman coefficients (optional) |
+| `--phib` | `PHIB` | starting phase, degrees (radians are detected and converted) |
+| `--fom` | `FOM` | starting figure of merit |
+| `--hl` | `HLA,HLB,HLC,HLD` | HL coefficients; used instead of `PHIB`/`FOM` when present |
 | `--free` | `FreeR` | free-set flag column; `--free-marker` selects the free value (default `0`) |
 | `--truth` | `PHIC` | reference phase, used only for self-assessment |
 
-### Output columns
-
-The output MTZ carries the input columns plus:
+Output columns (input columns are preserved):
 
 | Column | Type | Meaning |
 | --- | --- | --- |
 | `DM_FDM` | F | density-modification map coefficients |
 | `DM_PHIDM` | P | improved phase, degrees |
-| `DM_FOMDM` | W | figure of merit of `DM_PHIDM` |
-| `DM_FWT` | F | Fourier map coefficients from the improved phases |
-| `DM_PHWT` | P | phases of `DM_FWT` |
+| `DM_FOMDM` | W | figure of merit of `DM_PHIDM` (optimistic, see limitations) |
+| `DM_HLADM…HLDDM` | A | HL coefficients of the combined phase probability |
+| `DM_FWT` / `DM_PHWT` | F / P | σ_A-weighted map coefficients (what a builder should read) |
+| `DM_DELFWT` / `DM_PHDELFWT` | F / P | difference map coefficients |
+| `DM_FCDM` / `DM_PHICDM` | F / P | modified-map structure factors |
 
-`--stats` writes a JSON record of the run (per-cycle figures of merit, free-set statistics,
-SigmaQ estimates and the settings used).
-
----
-
-## Scoring a run
-
-`tools/evaluate.py` compares a result against reference phases and reports phase-error
-statistics (weighted mean phase error, mean `cos Δφ`, a σ_A-like correlation coefficient),
-map correlation coefficients, and per-resolution-shell breakdowns. Work and free sets are
-reported separately.
-
-```bash
-python tools/evaluate.py \
-  --case tests/data/7e1d.mtz --truth-col PHIC --fo-col FOBS --fom-col FOM --free-col FreeR \
-  --methods "initial=tests/data/7e1d.mtz:PHIB:FOM,v2=out/7e1d_v2.mtz:DM_PHIDM:DM_FOMDM" \
-  --out out/7e1d_eval
-```
-
-`python tools/evaluate.py --selftest` runs a synthetic self-check.
+`--stats FILE` writes a JSON record of the run (per-cycle figures of merit, free-set
+statistics, σ_A and Σ_Q per shell, and every setting used).
 
 ---
 
-## Verified results
+## How it works
 
-All numbers below were produced with the code in this repository.
+Each cycle:
 
-### Phase accuracy against reference phases
+1. **Best map** — centroid phase and FOM of the current HL distribution (numerical quadrature,
+   so bimodal SAD priors are handled), projected onto symmetry-allowed values for centric
+   reflections; FFT to a P1 grid.
+2. **Solvent envelope** — Abrahams–Leslie local-variance mask (`--mask variance`, default) or
+   Wang rolling sphere (`--mask wang`), thresholded at `--solc` with a soft sigmoid edge.
+3. **Histogram matching** — ordinal (rank) mapping of the protein-region density onto the
+   target distribution, with Parrot's mild ordinal squash.
+4. **Perturbation γ** — the nonlinearity of the modification is measured by perturbing the map
+   and taking the regression slope; the bias it introduces is divided out.
+5. **Recombination** — the modified map contributes a von Mises term with weight
+   `2·Fo·D·Fc/Σ_Q` (Sim/σ_A), damped by `--cmbwt` and added to the *original* HL coefficients
+   (`--anchor exp`), so information cannot compound across cycles.
+6. **Cross-validation** — a second map is built from the same mask and lookup table with the
+   free reflections deleted; the free-set amplitude CC drives stopping, and the best cycle is
+   restored.
 
-Bundled case `7e1d` (P 21 21 21, 2.50 Å, 6447 reflections, 340 free):
+## Knobs worth touching
 
-| Metric | Input (`PHIB`/`FOM`) | `oasis_dm` output |
-| --- | ---: | ---: |
-| weighted mean phase error (°) | 56.08 | **45.96** |
-| mean phase error (°) | 75.00 | **61.63** |
-| mean cos Δφ | 0.460 | **0.584** |
-| σ_A-like C | 0.541 | **0.720** |
-| map CC (whole cell) | 0.406 | **0.602** |
+| Option | Default | When to change it |
+| --- | --- | --- |
+| `--solc` | 0.5 | set it from the Matthews coefficient; ±0.05 changes little, ±0.15 hurts |
+| `--mask` / `--radius` | variance, 4 Å | `wang`/8 Å behaves like `dm`'s SOLMASK |
+| `--cmbwt` | 0.4 | lower (0.2–0.3) trusts the modified map less |
+| `--max-cycles` | 8 | true phase error is flat from ~cycle 5 |
+| `--hist-mode` | `cell` | `protein` conditions the target on `--solc` |
+| `--per-shell-d` | off | per-shell σ_A in `FWT` (no measurable effect on the bundled cases) |
 
-### End-to-end model building
-
-Measured in the OASIS4.3 pipeline on the `6zpp` calibration case (P 1 21 1, 2.50 Å), all with
-the same Buccaneer/REFMAC recipe:
-
-| Configuration | R-work | R-free |
-| --- | ---: | ---: |
-| CCP4 Parrot (baseline) | 0.4230 | 0.4392 |
-| `oasis_dm` + map conditioning | 0.3960 | 0.4207 |
-| `oasis_dm` + refinement bridge | **0.3347** | **0.3485** |
-
-These end-to-end numbers **depend on downstream CCP4 programs** (REFMAC and Buccaneer). They
-measure `oasis_dm` as the density-modification stage inside a working pipeline, not as a
-standalone builder.
+Everything else — `--x-max`, `--n-shells`, `--radius-decay`, `--sample-rate` — is saturated on
+the bundled cases: sweeping them moves the weighted phase error by less than 1°.
 
 ---
 
 ## Known limitations
 
-Read this before using `oasis_dm` to replace an existing density-modification step.
-
-1. **The raw `oasis_dm` map is often not directly traceable by Buccaneer.** On `6zpp`, the
-   phases improve but the initial build from the raw DM map traces few residues. Two workarounds
-   are known to work, and they are alternatives, not a stack:
-   - *map conditioning* — rescale `FWT` and mix `PHWT` toward the probability phase before
-     building (the pipeline's `--oasis-dm-map-scale` / `--oasis-dm-map-phase-mix` options);
-   - *refinement bridge* — refine a partial model against the frozen DM phases and rebuild from
-     the resulting σ_A model-phase map (the pipeline's `--oasis-dm-rebuild-cycles` option).
-2. **A single calibration case is not a benchmark.** The published numbers are one case for
-   phase accuracy and one case for end-to-end building. On `7e1d`, a lower combined weight
-   (`--cmbwt 0.1`) improves Buccaneer building but degrades the full pipeline; the default
-   `--cmbwt 0.4` is kept for that reason.
-3. **Parameter sensitivity is not fully mapped.** `mask_radius` is currently not forwarded to
-   the engine, and anisotropic correction is not implemented.
-4. **Free-set handling.** The engine uses the free-set flag to drive early stopping and, with
-   `--omit-free`, for unbiased SigmaQ estimation. It does not use free reflections as
-   additional phase observations.
+1. **The reported FOM is optimistic** by 0.08–0.29 (see the benchmark table). The Sim/σ_A weight
+   assumes the only error in the modified map is unmodelled structure, which is false when the
+   input phases are 40–60° off. `--cmbwt 0.4` damps this; it does not remove it. An attempt to
+   calibrate the weight from the free-set σ_A of the omit map does **not** work — the omit map
+   still contains ~95% of the reflections, so the amplitude ratio stays near 1 — and was
+   removed rather than shipped (see `CHANGELOG.md`).
+2. **Three cases, one resolution.** All bundled cases are 2.5 Å SAD data with ~50% solvent.
+   Nothing here is calibrated for low-resolution SAD, SIR/MIR, or very high solvent content.
+3. **No NCS averaging, no anisotropic correction, no phase extension.** NCS averaging is the
+   largest missing component for multi-copy ASUs.
+4. **Free-set handling.** The free flag drives stopping and the omit map; free reflections are
+   not used as extra phase observations. Below ~500 free reflections the omit-based σ_Q path
+   (`--sigmaq-source omit`) falls back to a work-dominated estimate.
+5. **`--anchor cumulative` is available but not recommended** — it inflates the FOM to ~0.88
+   and does not improve phases.
+6. **The bundled histogram library is a substitute** for CCP4's curated one. If you have CCP4,
+   let it find `$CLIBD/hist.lib`.
 
 ---
 
 ## Repository layout
 
 ```
-src/oasis_dm/        the engine
-  core.py            v1 engine and shared numerics (masking, HL recombination, FOM handling)
-  dm.py              v2 engine: omit-based unbiased SigmaQ + free-set early stopping
+src/oasis_dm/
+  core.py            v1 engine + shared numerics (mask, histogram LUT, HL recombination, I/O)
+  dm.py              v2 engine: omit map, free-set stopping, CLI
   cli.py             console entry point
-  paths.py           runtime data lookup (hist.lib)
-tools/evaluate.py    scoring against reference phases
-tests/               smoke tests and small bundled cases
+  paths.py           histogram-library resolution
+  data/protein_hist.lib   bundled target distribution
+tools/
+  benchmark.py       benchmark vs reference phases (+ optional cparrot)
+  evaluate.py        scoring against reference phases (plots optional)
+  make_hist_lib.py   regenerate the bundled histogram library
+  run_tests.py       test runner that needs no pytest
+tests/               smoke tests, numerics tests, bundled cases
 examples/            runnable example
 handdm_v2.py         compatibility shim for pipelines that resolve the engine by file name
 ```
@@ -178,8 +237,8 @@ handdm_v2.py         compatibility shim for pipelines that resolve the engine by
 ### Compatibility with existing deployments
 
 Earlier OASIS releases resolved the in-house engine as a script named `handdm_v2.py`. That name
-is kept at the repository root so an existing pipeline keeps working unchanged; it simply
-forwards to the packaged CLI.
+is kept at the repository root so an existing pipeline keeps working unchanged; it forwards to
+the packaged CLI.
 
 ---
 
@@ -188,11 +247,23 @@ forwards to the packaged CLI.
 - **Code**: MIT — see [LICENSE](LICENSE).
 - **Bundled test cases** (`tests/data/*.mtz`): derived from public PDB entries (`3o2e`,
   `6zpp`, `7e1d`) with simulated SAD observations. They contain `FOBS`, `SIGFOBS`, `FreeR`,
-  `PHIB`, `FOM`, `PHIC` and the Hendrickson–Lattman coefficients `HLA`–`HLD`.
-- **`hist.lib`** is a CCP4 data file and is **not** included. Obtain it from your own CCP4
-  installation.
+  `PHIB`, `FOM`, `PHIC` and HL coefficients `HLA`–`HLD`.
+  *Note*: the `6zpp` truth column was corrected in 2.1.0 — the original was offset by 180°·k
+  along **b** relative to `PHIB`, which made the case look catastrophic. See `CHANGELOG.md`.
+- **`oasis_dm/data/protein_hist.lib`**: generated here from public PDB entries, MIT like the
+  rest of the package.
+- **CCP4 `hist.lib`** is not included; obtain it from your own CCP4 installation.
 
 ## Citation
 
-If you use `oasis_dm` in published work, please cite the OASIS4.3 pipeline paper and state
-that density modification was performed with `oasis_dm` (DOI to be assigned).
+If you use `oasis_dm` in published work, cite the OASIS4.3 pipeline paper and state that
+density modification was performed with `oasis_dm` (see [CITATION.cff](CITATION.cff)).
+
+## Development
+
+```bash
+pip install -e ".[test]"
+python tools/run_tests.py        # no pytest needed
+python -m pytest tests -q        # if pytest is available
+python tools/benchmark.py        # benchmark, ~30 s on the bundled cases
+```
