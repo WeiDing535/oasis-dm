@@ -38,16 +38,22 @@ import numpy as np
 
 try:
     from . import __version__
-    from .core import (Config, DensityModifier, hl_centroid, wrap180, build_parser)
+    from .core import (Config, DensityModifier, hl_centroid, wrap180,
+                       fom_to_x, build_parser)
 except ImportError:  # direct script execution
-    from core import (Config, DensityModifier, hl_centroid, wrap180, build_parser)
+    from core import (Config, DensityModifier, hl_centroid, wrap180,
+                      fom_to_x, build_parser)
 
 
 @dataclass
 class ConfigV2(Config):
     sigmaq_source: str = 'blend'    # 'blend' (work-dominated, stable, default) |
+                                    # 'kfold' (k-fold omit maps: every reflection
+                                    # predicted from a map that never saw it --
+                                    # the honest SigmaQ) |
                                     # 'omit' (unbiased attempt, needs scale
                                     # correction to be stable) | 'work'
+    kfold: int = 5                  # number of k-fold omit maps per cycle
     auto_stop: bool = True
     max_cycles: int = 8
     min_cycles: int = 2
@@ -91,7 +97,8 @@ class DensityModifierV2(DensityModifier):
                      f'(work-dominated); cmbwt -> 0.4 to avoid FOM inflation')
         self.log(f'[v2  ] sigmaQ source={self.cfg.sigmaq_source}  '
                  f'auto_stop={self.cfg.auto_stop}  '
-                 f'free reflections={self.n_free_valid}')
+                 f'free reflections={self.n_free_valid}'
+                 + (f'  kfold={self.cfg.kfold}' if self.cfg.sigmaq_source == 'kfold' else ''))
 
     # ------------------------------------------------------------------
     def _estimate_gamma(self, rho, modify):
@@ -105,7 +112,61 @@ class DensityModifierV2(DensityModifier):
         return float(np.clip(g, 0.0, 0.9)), base
 
     # ------------------------------------------------------------------
-    def _sim_weight_v2(self, Fc_full, Fc_omit):
+    def _kfold_folds(self, k):
+        """Deterministic, resolution-shell-balanced fold labels for work reflections.
+
+        ``fold[i] in [0, k)`` for work reflections, ``-1`` otherwise.  Balanced
+        per shell so every fold map misses the same fraction of every shell.
+        """
+        if getattr(self, '_fold', None) is not None and self._fold_k == k:
+            return self._fold
+        rng = np.random.default_rng(self.cfg.seed + 777)
+        fold = np.full(self.nref, -1, dtype=np.int32)
+        for s in range(self.cfg.n_shells):
+            idx = np.nonzero(self.work & (self.shell == s))[0]
+            perm = rng.permutation(len(idx))
+            fold[idx[perm]] = np.arange(len(idx)) % k
+        self._fold, self._fold_k = fold, k
+        return fold
+
+    def _map_with_deleted(self, F_map, phi_deg, modify, gamma):
+        """Map coefficients -> (deleted set already zeroed) -> modified Fmod."""
+        rho = self.rho_from_grid(self._grid_from_coeffs(F_map, phi_deg))
+        rho_mod = modify(rho)
+        if gamma is not None:
+            rho_mod = (rho_mod - gamma * rho) / (1.0 - gamma)
+        return self.fmod_from_rho(rho_mod)
+
+    def _kfold_predictions(self, F_best, phi_deg, modify, gamma):
+        """Predict every work reflection from a map that never contained it.
+
+        The work reflections are split into ``k`` shell-balanced folds; fold
+        ``j`` is predicted from the map built with fold ``j`` *and the free set*
+        deleted.  The (Fo, Fpred) pairs therefore carry no self-reference bias,
+        unlike a fit on the map's own reflections (v1) or on a ~5% free set
+        predicted by a map that still contains the other ~95% of the data
+        (``sigmaq_source='omit'``).  The per-shell D and SigmaQ fitted on them
+        -- and the FOM that follows -- are honest.  Cost: ``k`` extra maps per
+        cycle.
+
+        Returns complex predictions; ``sigmaq_source='kfold'`` uses the
+        magnitudes, ``'kcal'`` also the phases.
+        """
+        k = max(int(self.cfg.kfold), 2)
+        fold = self._kfold_folds(k)
+        Fpred = np.full(self.nref, np.nan, dtype=np.complex128)
+        for j in range(k):
+            sel = fold == j
+            if not np.any(sel):
+                continue
+            F_map = F_best.copy()
+            F_map[sel | self.free] = 0.0
+            Fpred[sel] = self._map_with_deleted(F_map, phi_deg, modify, gamma)[sel]
+        return Fpred
+
+    # ------------------------------------------------------------------
+    def _sim_weight_v2(self, Fc_full, Fc_omit, Fpred=None,
+                       phi_best_rad=None, m_best=None):
         """Fit D and SigmaQ on OMITTED (free) reflections; returns X for all."""
         cfg = self.cfg
         X = np.zeros(self.nref, dtype=np.float64)
@@ -115,6 +176,12 @@ class DensityModifierV2(DensityModifier):
         if cfg.sigmaq_source == 'work':
             fitmask = self.work
             fc_fit = Fc_full
+        elif cfg.sigmaq_source in ('kfold', 'kcal') and Fpred is not None:
+            # honest: every fitting reflection was predicted by a map built
+            # without it, so (Fo - D*Fpred)^2 measures real map error
+            ap = np.abs(Fpred)
+            fitmask = self.work & np.isfinite(ap) & (ap > 0)
+            fc_fit = ap
         elif cfg.sigmaq_source == 'blend':
             # work-dominated, free reflections only help the per-shell counts
             fitmask = self.work | self.free_valid
@@ -150,6 +217,32 @@ class DensityModifierV2(DensityModifier):
             if np.any(idx):
                 X[idx] = np.clip(2.0 * Fo[idx] * (Ds[s] * Fc_full[idx]) / Qs[s],
                                  0.0, cfg.x_max)
+        # --- kcal: rescale the per-shell concentration X to the map's ------
+        # --- *measured* phase error, estimated from the disagreement -------
+        # --- between out-of-map k-fold predictions and the current phases --
+        # For independent errors E[cos(dphi_obs)] = cos_prior * cos_map, so
+        # cos_map = cos_obs / cos_prior and X_shell = fom_to_x(cos_map).
+        self._kcal_scale = np.ones(cfg.n_shells)
+        if (cfg.sigmaq_source == 'kcal' and Fpred is not None
+                and phi_best_rad is not None and m_best is not None):
+            ap = np.abs(Fpred)
+            dphi = np.angle(Fpred) - phi_best_rad
+            w = np.where(self.valid, np.asarray(m_best, float), 0.0)
+            for s in range(cfg.n_shells):
+                idx = (self.work & (self.shell == s) & np.isfinite(ap)
+                       & (ap > 0) & (w > 0.05))
+                if idx.sum() < 8:
+                    continue
+                sw = float(np.sum(w[idx]))
+                cos_obs = float(np.sum(w[idx] * np.cos(dphi[idx])) / sw)
+                cos_prior = float(np.sum(w[idx] * m_best[idx]) / sw)
+                r = cos_obs / max(cos_prior, 1e-3)
+                x_target = fom_to_x(np.clip(r, 0.0, 0.9995))
+                x_cur = float(np.mean(X[idx]))
+                if np.isfinite(x_target) and x_cur > 1e-6:
+                    self._kcal_scale[s] = x_target / x_cur
+            scale = self._kcal_scale[np.clip(self.shell, 0, cfg.n_shells - 1)]
+            X = np.where(self.valid, np.clip(X * scale, 0.0, cfg.x_max), 0.0)
         return X, Ds, Qs, Dg
 
     def _free_metric(self, Fc_omit):
@@ -208,16 +301,18 @@ class DensityModifierV2(DensityModifier):
             Fc_full = np.abs(Fmod)
 
             # --- omit map (SAME mask, SAME LUT) ---------------------------
-            rho_o = self.rho_from_grid(self._grid_from_coeffs(F_omit, phi_deg))
-            rho_mod_o = modify(rho_o)
-            if gamma is not None:
-                rho_mod_o = (rho_mod_o - gamma * rho_o) / (1.0 - gamma)
-            Fmod_o = self.fmod_from_rho(rho_mod_o)
+            Fmod_o = self._map_with_deleted(F_omit, phi_deg, modify, gamma)
             Fc_omit = np.abs(Fmod_o)
             free_cc, free_r = self._free_metric(Fc_omit)
 
+            # --- k-fold omit maps: honest out-of-map predictions ----------
+            Fpred = None
+            if cfg.sigmaq_source in ('kfold', 'kcal'):
+                Fpred = self._kfold_predictions(F_best, phi_deg, modify, gamma)
+
             # --- unbiased error estimate + phase recombination ------------
-            X, Ds, Qs, Dg = self._sim_weight_v2(Fc_full, Fc_omit)
+            X, Ds, Qs, Dg = self._sim_weight_v2(Fc_full, Fc_omit, Fpred,
+                                                phi_best_rad, m_best)
             wgt = cfg.cmbwt
             phi_mod = np.angle(Fmod)
             HL_mod = np.column_stack([wgt * X * np.cos(phi_mod),
@@ -339,11 +434,18 @@ def build_parser_v2():
                      'estimation and free-set early stopping')
     p.add_argument('--version', action='version',
                    version='oasis-dm ' + __version__)
-    p.add_argument('--sigmaq-source', choices=['omit', 'work', 'blend'],
+    p.add_argument('--sigmaq-source',
+                   choices=['kfold', 'kcal', 'omit', 'work', 'blend'],
                    default='blend',
                    help='which reflections fit SigmaQ (default blend = '
-                        'work-dominated, stable; omit is an experimental '
-                        'unbiased attempt)')
+                        'work-dominated, stable; kfold = k-fold omit maps, '
+                        'every reflection predicted from a map that never saw '
+                        'it, giving an honest SigmaQ and FOM; kcal = kfold '
+                        'plus a phase-disagreement calibration of the X '
+                        'concentration; omit is an experimental unbiased '
+                        'attempt)')
+    p.add_argument('--kfold', type=int, default=5,
+                   help='number of k-fold omit maps per cycle (kfold mode)')
     p.add_argument('--auto-stop', action='store_true', default=True)
     p.add_argument('--no-auto-stop', dest='auto_stop', action='store_false',
                    help='disable free-set early stopping (fixed --cycles)')
@@ -363,7 +465,7 @@ def build_parser_v2():
     p.add_argument('--min-free', type=float, default=500.0,
                    help='below this many valid free reflections, auto-fallback '
                         'SigmaQ to blend (work-dominated) + cmbwt 0.4')
-    p.set_defaults(cmbwt=0.4, n_shells=10)
+    p.set_defaults(n_shells=10)
     return p
 
 
@@ -383,7 +485,8 @@ def main(argv=None):
                    solv_on=not args.no_solv, squash=not args.no_squash,
                    gamma_on=not args.no_gamma, omit_free=args.omit_free,
                    anchor=args.anchor, n_shells=args.n_shells, x_max=args.x_max,
-                   cmbwt=args.cmbwt, restore=args.restore,
+                   cmbwt=(args.cmbwt if args.cmbwt is not None else 0.4),
+                   restore=args.restore,
                    sample_rate=args.sample_rate, seed=args.seed,
                    stats=args.stats, tag=args.tag, quiet=args.quiet,
                    sigmaq_source=args.sigmaq_source, auto_stop=args.auto_stop,
@@ -391,7 +494,7 @@ def main(argv=None):
                    patience=args.patience, free_metric=args.free_metric,
                    min_free=args.min_free, min_improve=args.min_improve,
                    omit_fc=args.omit_fc, hist_mode=args.hist_mode,
-                   per_shell_d=args.per_shell_d)
+                   per_shell_d=args.per_shell_d, kfold=args.kfold)
     DensityModifierV2(cfg).run()
     return 0
 

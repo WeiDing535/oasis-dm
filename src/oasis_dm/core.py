@@ -846,7 +846,11 @@ def build_parser():
     p.add_argument('--anchor', choices=['exp', 'cumulative'], default='exp')
     p.add_argument('--n-shells', type=int, default=20)
     p.add_argument('--x-max', type=float, default=12.0)
-    p.add_argument('--cmbwt', type=float, default=0.4)
+    p.add_argument('--cmbwt', type=float, default=None,
+                   help='weight of the DM-derived HL contribution (default 0.4, '
+                        'v1-calibrated; measured on the bundled cases this also '
+                        'gives better phase error and a more honest FOM than 1.0 '
+                        'with --sigmaq-source kfold)')
     p.add_argument('--restore', type=float, default=0.0)
     p.add_argument('--sample-rate', type=float, default=3.0)
     p.add_argument('--seed', type=int, default=0)
@@ -872,7 +876,8 @@ def main(argv=None):
                  solv_on=not args.no_solv, squash=not args.no_squash,
                  gamma_on=not args.no_gamma, omit_free=args.omit_free,
                  anchor=args.anchor, n_shells=args.n_shells, x_max=args.x_max,
-                 cmbwt=args.cmbwt, restore=args.restore,
+                 cmbwt=(args.cmbwt if args.cmbwt is not None else 0.4),
+                 restore=args.restore,
                  sample_rate=args.sample_rate, seed=args.seed,
                  stats=args.stats, tag=args.tag, quiet=args.quiet)
     dm = DensityModifier(cfg)
