@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.3.0] — 2026-11-23
+
+A graphical interface, plus a version-string fix.
+
+### Added
+
+- **`oasis-dm-gui` (or `python -m oasis_dm.gui`)** — a browser-based front end.
+  It starts a local HTTP server from the standard library only (bound to
+  127.0.0.1, per-session token, no external assets or JavaScript libraries)
+  and opens the default browser. The page offers a directory browser for
+  picking the input/output MTZ, auto-detects the Fo / σ(Fo) / PHIB / FOM /
+  free columns from the file header, exposes the engine options (solvent
+  content, max cycles, free-set early stop, mask, histogram target, free
+  metric, phase extension, anisotropic correction, NCS none/file/auto,
+  SigmaQ source, histogram library), previews the exact `oasis-dm` command
+  line before launching, streams the engine log, plots free-set cc per cycle,
+  and stops the run cleanly. The engine always runs as a
+  `python -m oasis_dm` subprocess, so the GUI adds no dependency and no GUI
+  toolkit on the Python side — deliberately not Tkinter, whose system-Python
+  builds are frequently unusable (on macOS 15 with the Xcode toolchain
+  Python, `Tk()` aborts the process).
+  - Tests: argv construction and column auto-detection logic, engine log
+    parsing, directory listing, and full HTTP round trips including a real
+    engine run and a mid-run Stop through the same JSON API the page uses.
+
+### Fixed
+
+- `oasis_dm.__version__` was still `2.1.0` while the package metadata said
+  2.2.0, so `oasis-dm --version` reported the wrong release. Both now say
+  2.3.0.
+
 ## [2.2.0] — 2026-11-22
 
 Three engine capabilities: honest k-fold FOM calibration, phase extension with

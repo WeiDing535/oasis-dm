@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oasis-dm"
-version = "2.2.0"
+version = "2.3.0"
 description = "Density modification (phase improvement) for macromolecular crystallography, without CCP4"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,6 +37,7 @@ test = ["pytest>=7"]
 
 [project.scripts]
 oasis-dm = "oasis_dm.cli:main"
+oasis-dm-gui = "oasis_dm.gui:main"
 
 [project.urls]
 Homepage = "https://github.com/WeiDing535/oasis-dm"
