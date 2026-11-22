@@ -178,3 +178,39 @@ if __name__ == "__main__":
             failures += 1
             print("FAIL %s: %s" % (name, exc))
     sys.exit(1 if failures else 0)
+
+
+def test_difference_map_exports_complex_coefficients(tmp_path):
+    output = _run(DATA / "6zpp.mtz", tmp_path / "difference.mtz",
+                  "--map-update", "difference", "--no-auto-stop", "--cycles", "2")
+    mtz = gemmi.read_mtz_file(str(output))
+
+    def column(label):
+        return np.asarray(mtz.column_with_label(label), dtype=float)
+
+    def complex_coeff(amp, phase):
+        return column(amp) * np.exp(1j * np.deg2rad(column(phase)))
+
+    best = complex_coeff("DM_FWT", "DM_PHWT")
+    difference = complex_coeff("DM_DELFWT", "DM_PHDELFWT")
+    posterior = column("FOBS") * complex_coeff("DM_FOMDM", "DM_PHIDM")
+    centric = mtz.spacegroup.operations().centric_flag_array(mtz.make_miller_array())
+    measured = np.isfinite(column("FOBS")) & (column("FOBS") > 0)
+    np.testing.assert_allclose(best[measured & centric], posterior[measured & centric],
+                               rtol=1e-5, atol=1e-4)
+    np.testing.assert_allclose(best[measured & ~centric] - difference[measured & ~centric],
+                               posterior[measured & ~centric], rtol=1e-5, atol=1e-4)
+
+
+def test_posterior_map_export_uses_observed_amplitude_scale(tmp_path):
+    output = _run(DATA / "6zpp.mtz", tmp_path / "posterior.mtz", "--aniso",
+                  "--map-update", "difference", "--map-output", "posterior",
+                  "--no-auto-stop", "--cycles", "2")
+    mtz = gemmi.read_mtz_file(str(output))
+    fo = mtz.column_with_label("FOBS").array
+    measured = np.isfinite(fo) & (fo > 0)
+    fom = mtz.column_with_label("DM_FOMDM").array
+    np.testing.assert_allclose(mtz.column_with_label("DM_FWT").array[measured],
+                               (fo * fom)[measured], rtol=1e-6)
+    np.testing.assert_allclose(mtz.column_with_label("DM_PHWT").array[measured],
+                               mtz.column_with_label("DM_PHIDM").array[measured])

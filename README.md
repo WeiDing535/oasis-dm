@@ -47,6 +47,28 @@ oasis-dm --mtzin input.mtz --mtzout output.mtz ... \
          --ncs ncs_operators.txt     # or --ncs-auto to detect + gate it
 ```
 
+## Work-only SAD maps for model building
+
+For an MTZ whose free reflections have already been excluded, this recipe
+recycles complex difference coefficients during density modification and
+exports a posterior-weighted map for Buccaneer:
+
+```bash
+oasis-dm --mtzin work.mtz --mtzout dm.mtz \
+  --solc 0.5 --radius 3 --radius-min 3 --aniso \
+  --no-auto-stop --cycles 12 --map-update difference --map-output posterior
+```
+
+`--map-update difference` uses shell-scaled complex 2mFo−DFc coefficients for
+acentric reflections and integrates the two allowed phase states for centric
+reflections. `--map-output posterior` writes the original observed amplitude
+times the posterior FOM to `DM_FWT`, and the posterior phase to `DM_PHWT`.
+With `--map-output standard`, the difference-update mode exports its complex
+map coefficients. Both modes retain the posterior `DM_PHIDM` and
+`DM_FOMDM` columns. For a Buccaneer comparison using observed amplitudes,
+pass those columns as the phase/FOM input for both engines. The command-line
+defaults retain the original recipe.
+
 ## Desktop app
 
 A native window (PySide6 / Qt 6) that maps one-to-one onto the command line: pick the

@@ -422,6 +422,24 @@ class DensityModifier:
             a, a + 180.0))
         return out
 
+    def _phase_moments(self, hl):
+        """Integrate the prior over exactly two phases for centric reflections."""
+        phase, merit = hl_centroid(hl)
+        centric = self.centric
+        axis = np.deg2rad(self.phi_allow[centric])
+        ab = hl[centric, :2]
+        field = ab[:, 0] * np.cos(axis) + ab[:, 1] * np.sin(axis)
+        phase[centric] = axis + np.pi * (field < 0)
+        merit[centric] = np.abs(np.tanh(field))
+        return phase, merit
+
+    def _difference_coefficients(self, weighted, phase, modified, scale):
+        """Build complex 2mFo-DFc and mFo-DFc coefficients."""
+        posterior = weighted * np.exp(1j * phase)
+        model = scale * modified
+        best = np.where(self.centric, posterior, 2 * posterior - model)
+        return best, posterior - model
+
     # ------------------------- FFT helpers --------------------------------
     def _grid_from_coeffs(self, F, phi_deg):
         """ASU (F, phi) -> full P1 reciprocal grid, via gemmi symmetry expansion."""
@@ -747,12 +765,25 @@ class DensityModifier:
         Fdel = m * Fo - D * Fc
         phi_out = np.where(self.valid, phi_deg, phi_mod_deg)
         fom_out = np.where(self.valid, m, 0.0)
+        fwt_out, phwt_out = np.maximum(Fwt, 0.0), phi_out
+        fdel_out, phdel_out = Fdel, phi_out
+        if getattr(cfg, 'map_update', 'posterior') == 'difference':
+            best, difference = self._difference_coefficients(
+                m * Fo, self.best_phi_rad, self.Fmod, self.D_shell[self.shell])
+            best = np.where(self.valid, best, cfg.restore * self.Fmod)
+            difference = np.where(self.valid, difference, 0j)
+            fwt_out, phwt_out = np.abs(best), np.rad2deg(np.angle(best))
+            fdel_out, phdel_out = np.abs(difference), np.rad2deg(np.angle(difference))
+        if getattr(cfg, 'map_output', 'standard') == 'posterior':
+            observed = np.nan_to_num(getattr(self, '_Fo_raw', self.Fo))
+            fwt_out = np.where(self.valid, m * observed, cfg.restore * Fc)
+            phwt_out = phi_out
         newcols = [
             Fdm, phi_out, fom_out,
             self.HL_final[:, 0], self.HL_final[:, 1],
             self.HL_final[:, 2], self.HL_final[:, 3],
-            np.maximum(Fwt, 0.0), phi_out,
-            Fdel, phi_out,
+            fwt_out, phwt_out,
+            fdel_out, phdel_out,
             Fc, phi_mod_deg,
         ]
         for v in newcols:

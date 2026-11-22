@@ -40,7 +40,7 @@ def main(argv=None):
     for lbl in [a.phib, a.fom] + list(a.hl):
         if lbl not in labels:
             p.error(f'column {lbl} not found in {a.mtzin}')
-    arr = np.asarray(m.array, copy=True)
+    arr = np.array(m.array, copy=True)
     d = np.asarray(m.make_d_array(), dtype=np.float64)
     sel = d < a.dmin_phase
     for lbl in [a.phib, a.fom] + list(a.hl):

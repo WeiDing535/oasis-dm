@@ -78,6 +78,8 @@ class ConfigV2(Config):
                                     # because the simplified omit SigmaQ estimate
                                     # is optimistic (free set is only ~5% of
                                     # reflections) and must not inflate FOM
+    map_update: str = 'posterior'   # 'difference' iterates complex map coefficients
+    map_output: str = 'standard'    # 'posterior' writes observed mFo and posterior phase
     n_shells: int = 10              # fewer shells -> more reflections each
 
     def as_dict(self):
@@ -322,7 +324,15 @@ class DensityModifierV2(DensityModifier):
     def run(self):
         cfg = self.cfg
         HL_exp = self.HL_exp.copy()
+        use_difference_map = cfg.map_update == 'difference'
+        if use_difference_map and self.hl_source.startswith('PHIB/FOM'):
+            centric = self.valid & self.centric
+            field = np.arctanh(np.clip(self.fom_in[centric], 0, 0.99995))
+            phase = self._project_centric(np.deg2rad(self.phi_exp_deg))[centric]
+            HL_exp[centric, 0] = field * np.cos(phase)
+            HL_exp[centric, 1] = field * np.sin(phase)
         HL_cur = HL_exp.copy()
+        moments = self._phase_moments if use_difference_map else hl_centroid
         Fo = np.nan_to_num(self.Fo)
         stats = []
         self.stats = stats          # shared list, used for per-cycle RNG seeding
@@ -330,6 +340,7 @@ class DensityModifierV2(DensityModifier):
         rho_prev = None
         t0 = time.time()
         ncycles = cfg.max_cycles if cfg.auto_stop else cfg.cycles
+        has_free_observations = bool(np.any(self.free_valid))
         best = None
         prev_score = None
         plateau = 0
@@ -369,6 +380,7 @@ class DensityModifierV2(DensityModifier):
         ext_act = np.zeros(self.nref, dtype=bool)
         ext_order = None
         n_on_prev = 0
+        previous_active = self.valid
         if n_ext:
             if cfg.extend:
                 order = np.argsort(-self.d[ext_work])     # coarse shells first
@@ -402,12 +414,17 @@ class DensityModifierV2(DensityModifier):
             self._active = active
             Fo = np.nan_to_num(self.Fo)     # refreshed: aniso may rescale Fo
 
-            phi_best_rad, m_best = hl_centroid(HL_cur)
+            phi_best_rad, m_best = moments(HL_cur)
             phi_best_rad = self._project_centric(phi_best_rad)
             phi_deg = np.rad2deg(phi_best_rad)
             F_best = np.where(active, m_best * Fo, 0.0)
-            F_omit = F_best.copy()
-            F_omit[self.free] = 0.0
+            if use_difference_map and cyc > 1:
+                best_map, _ = self._difference_coefficients(
+                    F_best, phi_best_rad, Fmod, Ds[self.shell])
+                best_map = np.where(previous_active, best_map, 0j)
+                F_best, phi_deg = np.abs(best_map), np.rad2deg(np.angle(best_map))
+            previous_active = active
+            F_omit = np.where(self.free, 0.0, F_best) if has_free_observations else None
 
             # --- full map -------------------------------------------------
             rho = self.rho_from_grid(self._grid_from_coeffs(F_best, phi_deg))
@@ -436,6 +453,8 @@ class DensityModifierV2(DensityModifier):
                     # variants on THIS cycle's map and keep averaging
                     # only if it does not degrade the free-set cc.
                     def _trial_cc(mdf):
+                        if F_omit is None:
+                            return float('nan')
                         g = None
                         if cfg.gamma_on:
                             g, rmod = self._estimate_gamma(rho, mdf)
@@ -484,9 +503,12 @@ class DensityModifierV2(DensityModifier):
             Fc_full = np.abs(Fmod)
 
             # --- omit map (SAME mask, SAME LUT) ---------------------------
-            Fmod_o = self._map_with_deleted(F_omit, phi_deg, modify, gamma)
-            Fc_omit = np.abs(Fmod_o)
-            free_cc, free_r = self._free_metric(Fc_omit)
+            if F_omit is not None:
+                Fc_omit = np.abs(self._map_with_deleted(F_omit, phi_deg, modify, gamma))
+                free_cc, free_r = self._free_metric(Fc_omit)
+            else:
+                Fc_omit = Fc_full
+                free_cc = free_r = float('nan')
 
             # --- k-fold omit maps: honest out-of-map predictions ----------
             Fpred = None
@@ -506,7 +528,7 @@ class DensityModifierV2(DensityModifier):
                 HL_new = HL_exp + HL_mod      # anchored to the ORIGINAL experiment
             else:
                 HL_new = HL_cur + HL_mod      # cumulative (faster, more model bias)
-            phi_new_rad, m_new = hl_centroid(HL_new)
+            phi_new_rad, m_new = moments(HL_new)
             phi_new_rad = self._project_centric(phi_new_rad)
             HL_cur = HL_new
 
@@ -648,6 +670,8 @@ class DensityModifierV2(DensityModifier):
         payload['final'].update(dict(best_cycle=self.best_cycle,
                                      n_cycles_run=len(self.stats),
                                      sigmaq_source=self.cfg.sigmaq_source,
+                                     map_update=self.cfg.map_update,
+                                     map_output=self.cfg.map_output,
                                      auto_stop=self.cfg.auto_stop,
                                      early_stop_available=self.early_stop_available,
                                      n_ext=int(np.sum(self.ext)),
@@ -679,6 +703,12 @@ def build_parser_v2():
                         'plus a phase-disagreement calibration of the X '
                         'concentration; omit is an experimental unbiased '
                         'attempt)')
+    p.add_argument('--map-update', choices=['posterior', 'difference'],
+                   default='posterior',
+                   help='Recycle posterior mFo or complex 2mFo-DFc coefficients')
+    p.add_argument('--map-output', choices=['standard', 'posterior'],
+                   default='standard',
+                   help='Write standard map coefficients or posterior mFo/phase in DM_FWT/DM_PHWT')
     p.add_argument('--kfold', type=int, default=5,
                    help='number of k-fold omit maps per cycle (kfold mode)')
     p.add_argument('--no-extend', dest='extend', action='store_false',
@@ -754,7 +784,8 @@ def main(argv=None):
                    omit_fc=args.omit_fc, hist_mode=args.hist_mode,
                    per_shell_d=args.per_shell_d, kfold=args.kfold,
                    extend=args.extend, ext_steps=args.ext_steps,
-                   aniso=args.aniso, ncs=args.ncs, ncs_auto=args.ncs_auto)
+                   aniso=args.aniso, ncs=args.ncs, ncs_auto=args.ncs_auto,
+                   map_update=args.map_update, map_output=args.map_output)
     DensityModifierV2(cfg).run()
     return 0
 

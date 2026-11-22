@@ -40,7 +40,7 @@ def main(argv=None):
     for lbl in (a.fo, a.sigfo):
         if lbl not in labels:
             p.error(f'column {lbl} not found in {a.mtzin}')
-    arr = np.asarray(m.array, copy=True)
+    arr = np.array(m.array, copy=True)
     hkl = np.asarray(m.make_miller_array(), dtype=np.float64)
     qz = hkl[:, 2] / cell.c
     qxy2 = (hkl[:, 0] / cell.a) ** 2 + (hkl[:, 1] / cell.b) ** 2

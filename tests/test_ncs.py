@@ -176,7 +176,7 @@ def test_ncs_engine_smoke():
         stats = Path(tmp) / "stats.json"
         out = _run(DATA / "3i0t.mtz", Path(tmp) / "ncs.mtz",
                    "--ncs", str(DATA / "3i0t_ncs.txt"),
-                   "--no-auto-stop", "--max-cycles", "1",
+                   "--no-auto-stop", "--cycles", "1",
                    "--stats", str(stats))
         m = gemmi.read_mtz_file(str(out))
         labels = set(m.column_labels())
