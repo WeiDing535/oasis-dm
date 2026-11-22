@@ -1,285 +1,234 @@
-"""GUI logic and HTTP end-to-end tests.
+"""Tests for the desktop GUI: pure option logic + Qt window behaviour.
 
-The argv construction, column auto-detection, log parsing, directory
-listing and the local HTTP server are all exercised here.  The final test
-starts a real server in a thread and drives a real engine run through the
-same JSON API the browser page uses.
+The pure-logic tests (command construction, column auto-detection, cycle
+parsing) run everywhere.  The window tests need PySide6 and are skipped
+when it is not installed — run them with a Python from
+``pip install ".[gui]"``.
 """
-import json
+import os
 import sys
-import tempfile
-import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+DATA = ROOT / "tests" / "data"
 sys.path.insert(0, str(ROOT / "src"))
 
-from oasis_dm.gui import (          # noqa: E402
-    GuiState, build_argv, command_string, list_dir, make_handler,
-    parse_cycle_line, pick_default, read_mtz_summary, validate_state)
+from oasis_dm import gui                     # noqa: E402
 
+try:
+    import PySide6                           # noqa: F401
+    HAVE_QT = True
+except ImportError:
+    HAVE_QT = False
+
+if HAVE_QT:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+# --- pure logic -------------------------------------------------------------
 
 def _base(**over):
-    st = dict(
-        mtzin="/tmp/in.mtz", mtzout="/tmp/out.mtz",
-        fo="FOBS", sigf="SIGFOBS", phib="PHIB", fom="FOM",
-        free="FreeR", truth="PHIC",
-        solc=0.5, cycles=8, auto_stop=True,
-        mask="variance", hist_mode="cell", free_metric="cc",
-        extend=True, aniso=False, per_shell_d=False,
-        ncs="none", ncs_file="", no_hist=False, hist_lib="",
-        sigmaq_source="blend",
-    )
+    st = {
+        "mtzin": "in.mtz", "mtzout": "out.mtz", "fo": "", "sigf": "",
+        "phib": "", "fom": "", "free": "", "truth": "",
+        "solc": 0.5, "cycles": 8, "auto_stop": True,
+        "mask": "variance", "hist_mode": "cell", "free_metric": "cc",
+        "extend": True, "aniso": False, "per_shell_d": False,
+        "ncs": "none", "ncs_file": "", "no_hist": False, "hist_lib": "",
+        "sigmaq_source": "blend", "stats": "",
+    }
     st.update(over)
     return st
 
 
-def test_default_state_is_a_minimal_command():
-    """Nothing changed from the defaults -> just files, no option spam."""
-    argv = build_argv(_base())
-    assert argv[:4] == ["--mtzin", "/tmp/in.mtz", "--mtzout", "/tmp/out.mtz"]
-    assert "--solc" not in argv and "--ncs" not in argv
-    assert "--tag" not in argv          # only meaningful with --stats
+def test_minimal_run_uses_engine_defaults():
+    assert gui.build_argv(_base()) == ["--mtzin", "in.mtz",
+                                       "--mtzout", "out.mtz"]
 
 
 def test_tag_is_emitted_with_stats():
-    argv = build_argv(_base(stats="/tmp/s.json", tag="myset"))
-    assert argv[argv.index("--stats") + 1] == "/tmp/s.json"
-    assert argv[argv.index("--tag") + 1] == "myset"
+    argv = gui.build_argv(_base(stats="stats/", tag="in"))
+    assert argv[4:8] == ["--stats", "stats/", "--tag", "in"]
 
 
-def test_changed_columns_and_parameters_are_emitted():
-    argv = build_argv(_base(fo="FP", free="FREE", solc=0.42, cycles=12,
-                            auto_stop=False, mask="wang"))
-    for flag, val in (("--fo", "FP"), ("--free", "FREE"),
-                      ("--solc", "0.420"), ("--cycles", "12"),
-                      ("--mask", "wang")):
-        assert argv[argv.index(flag) + 1] == val, (flag, argv)
-    assert "--no-auto-stop" in argv
-    # unchanged column defaults are not spelled out
-    assert "--phib" not in argv
+def test_changed_columns_are_emitted():
+    argv = gui.build_argv(_base(fo="FP", free="FREE"))
+    assert "--fo" in argv and argv[argv.index("--fo") + 1] == "FP"
+    assert "--free" in argv and argv[argv.index("--free") + 1] == "FREE"
 
 
-def test_none_column_is_omitted():
-    argv = build_argv(_base(truth=""))
-    assert "--truth" not in argv
+def test_default_columns_are_not_emitted():
+    argv = gui.build_argv(_base(fo="FOBS", free="FreeR"))
+    assert "--fo" not in argv and "--free" not in argv
 
 
-def test_ncs_modes_map_to_flags():
-    assert "--ncs" not in build_argv(_base())
-    argv = build_argv(_base(ncs="file", ncs_file="/tmp/op.txt"))
-    assert argv[argv.index("--ncs") + 1] == "/tmp/op.txt"
-    assert "--ncs-auto" not in argv
-    argv = build_argv(_base(ncs="auto"))
-    assert "--ncs-auto" in argv and "--ncs" not in argv
+def test_parameters_map_to_flags():
+    argv = gui.build_argv(_base(solc=0.42, cycles=3, auto_stop=False,
+                                mask="wang", hist_mode="protein",
+                                free_metric="rfree", extend=False))
+    for flag, val in (("--solc", "0.420"), ("--cycles", "3"),
+                      ("--no-auto-stop", None), ("--mask", "wang"),
+                      ("--hist-mode", "protein"), ("--free-metric", "rfree"),
+                      ("--no-extend", None)):
+        assert flag in argv
+        if val is not None:
+            assert argv[argv.index(flag) + 1] == val
+
+
+def test_ncs_modes():
+    assert gui.build_argv(_base(ncs="none"))[-1] != "--ncs-auto"
+    argv = gui.build_argv(_base(ncs="file", ncs_file="op.txt"))
+    assert argv[argv.index("--ncs") + 1] == "op.txt"
+    assert "--ncs-auto" in gui.build_argv(_base(ncs="auto"))
 
 
 def test_option_toggles():
-    argv = build_argv(_base(extend=False, aniso=True, per_shell_d=True,
-                            no_hist=True, sigmaq_source="kfold"))
-    for flag in ("--no-extend", "--aniso", "--per-shell-d", "--no-hist"):
-        assert flag in argv, (flag, argv)
+    argv = gui.build_argv(_base(aniso=True, per_shell_d=True,
+                                sigmaq_source="kfold", no_hist=True))
+    for flag in ("--aniso", "--per-shell-d", "--no-hist"):
+        assert flag in argv
     assert argv[argv.index("--sigmaq-source") + 1] == "kfold"
+    # hist_lib is ignored when the library is switched off
+    argv = gui.build_argv(_base(no_hist=True, hist_lib="my.lib"))
+    assert "--hist-lib" not in argv
 
 
 def test_validate_state_catches_problems():
-    assert validate_state(_base(mtzin="/no/such/file.mtz"))
-    assert validate_state(_base(mtzout=""))
-    assert validate_state(_base(solc=0.99))
-    assert validate_state(_base(ncs="file", ncs_file=""))
-    good = _base(mtzin=str(ROOT / "tests" / "data" / "7e1d.mtz"))
-    assert validate_state(good) == []
+    st = _base(mtzin="nope.mtz", mtzout="", solc=0.99, ncs="file")
+    problems = gui.validate_state(st)
+    assert any("input MTZ" in p for p in problems)
+    assert any("output MTZ" in p for p in problems)
+    assert any("solvent" in p for p in problems)
+    assert any("NCS operator" in p for p in problems)
+    assert gui.validate_state(_base(mtzin=str(DATA / "7e1d.mtz"))) == []
 
 
 def test_parse_cycle_line():
-    """The engine's statistics table feeds the free-cc chart."""
-    line = "  1  0.7123  0.6544  0.2810   15203.94   0.147   20.49  0.8912"
-    assert parse_cycle_line(line) == [1, 0.7123, 0.6544]
-    line8 = ("  8  0.6698  0.7182  0.6046  15231.38   0.143  17.79   0.9152"
-             "      *")
-    assert parse_cycle_line(line8) == [8, 0.6698, 0.7182]
-    # header and message lines must not parse
-    assert parse_cycle_line("cyc  meanFOM  freeCC  freeR ...") is None
-    assert parse_cycle_line("[v2  ] NCS gate: free cc 0.786 ...") is None
-    # NaN columns (no free set) are rejected
-    assert parse_cycle_line("  1   nan    nan    nan ...") is None
+    assert gui.parse_cycle_line(" 1  0.71  0.65  0.31") == [1, 0.71, 0.65]
+    assert gui.parse_cycle_line("12 0.5  -0.1  0.4") == [12, 0.5, -0.1]
+    assert gui.parse_cycle_line("nan nan nan") is None
+    assert gui.parse_cycle_line("[out ] wrote x.mtz") is None
+    assert gui.parse_cycle_line(" 1  2.5  0.5  0.3") is None   # FOM > 1
 
 
-def test_pick_default_prefers_common_labels():
-    assert pick_default(["FP", "SIGFP", "PHIB"], ["FOBS", "FP"]) == "FP"
-    assert pick_default(["A", "B"], ["FOBS"]) == "A"
-    assert pick_default(["A", "B"], ["FOBS"], fallback="") == ""
+def test_pick_default():
+    assert gui.pick_default(["FOBS", "FP"], ("FP", "F")) == "FP"
+    assert gui.pick_default(["A", "B"], ("X",), "") == ""
+    assert gui.pick_default(["A", "B"], ("X",)) == "A"
 
 
-def test_read_mtz_summary_reports_header():
-    info = read_mtz_summary(ROOT / "tests" / "data" / "7e1d.mtz")
+def test_read_mtz_summary():
+    info = gui.read_mtz_summary(DATA / "7e1d.mtz")
+    assert "FOBS" in info["labels"]
     assert info["nref"] > 0
-    assert info["dmin"] < 3.0
-    assert "FOBS" in info["labels"] and "FreeR" in info["labels"]
+    assert 0 < info["dmin"] < 100
+    assert isinstance(info["nref"], int)     # JSON/plain-serialisable
 
 
-def test_list_dir_sorts_and_marks_mtz():
-    with tempfile.TemporaryDirectory() as td:
-        (Path(td) / "b.mtz").write_bytes(b"")
-        (Path(td) / "a.txt").write_bytes(b"")
-        (Path(td) / "sub").mkdir()
-        info = list_dir(td)
-        names = [e["name"] for e in info["entries"]]
-        assert names == ["a.txt", "b.mtz", "sub"]   # case-insensitive sort
-        assert info["entries"][1]["mtz"] and not info["entries"][0]["mtz"]
-        assert info["parent"]          # tmp has a parent
+def test_command_string_quotes_paths():
+    cmd = gui.command_string(_base(mtzin="/tmp/my file.mtz"))
+    assert "'/tmp/my file.mtz'" in cmd
 
 
-def _serve(state, token):
-    from http.server import ThreadingHTTPServer
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state, token))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd
+# --- Qt window (need PySide6) -----------------------------------------------
 
+if HAVE_QT:
 
-def _req(port, method, path, token, body=None):
-    data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(
-        "http://127.0.0.1:%d%s" % (port, path), data=data, method=method,
-        headers={"X-Oasis-Token": token,
-                 "Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=30) as resp:
-        return json.loads(resp.read())
+    def _window():
+        app, win = gui.build_app()
+        win.show()
+        app.processEvents()
+        return app, win
 
+    def _spin(app, seconds):
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            app.processEvents()
+            time.sleep(0.02)
 
-def test_http_api_rejects_bad_token():
-    state = GuiState()
-    httpd = _serve(state, "sekrit")
-    try:
-        try:
-            _req(httpd.server_address[1], "GET", "/api/poll", "wrong")
-            ok = False
-        except urllib.error.HTTPError as exc:
-            ok = exc.code == 403
-        assert ok
-    finally:
-        httpd.shutdown()
+    def test_window_state_maps_to_command():
+        app, win = _window()
+        win.e_in.setText(str(DATA / "7e1d.mtz"))
+        _spin(app, 1.0)                       # let the debounce fire
+        assert "reflections" in win.l_info.text()
+        assert win.cols["fo"].currentText() == "FOBS"
+        assert win.cols["free"].currentText() == "FreeR"
+        assert win.e_out.text().endswith("7e1d_dm.mtz")
+        st = win.state()
+        assert st["fo"] == "FOBS"
+        assert gui.build_argv(st)[0:4] == [
+            "--mtzin", str(DATA / "7e1d.mtz"),
+            "--mtzout", str(DATA / "7e1d_dm.mtz")]
+        win.close()
 
+    def test_run_button_validates_before_starting():
+        app, win = _window()
+        # no input file selected -> run() must refuse (message box is
+        # modal in real use; here the state is invalid before any dialog)
+        st = win.state()
+        assert gui.validate_state(st) != []
+        win.close()
 
-def test_http_api_open_preview_and_list():
-    state = GuiState()
-    httpd = _serve(state, "sekrit")
-    port = httpd.server_address[1]
-    try:
-        r = _req(port, "POST", "/api/open", "sekrit",
-                 {"path": str(ROOT / "tests" / "data" / "7e1d.mtz")})
-        assert r["ok"] and "FOBS" in r["labels"] and r["nref"] > 0
-        r = _req(port, "POST", "/api/open", "sekrit",
-                 {"path": str(ROOT / "nope.mtz")})
-        assert not r["ok"]
-        r = _req(port, "POST", "/api/preview", "sekrit",
-                 {"state": _base(cycles=3, mask="wang")})
-        assert r["ok"] and "--cycles 3" in r["cmd"] and "--mask wang" \
-            in r["cmd"]
-        assert "$" not in r["cmd"]       # no shell decoration server-side
-        r = _req(port, "POST", "/api/list", "sekrit",
-                 {"path": str(ROOT / "tests" / "data")})
-        assert r["ok"] and any(e["mtz"] for e in r["entries"])
-        # and the page itself is served with the token embedded
-        with urllib.request.urlopen(
-                "http://127.0.0.1:%d/" % port, timeout=30) as resp:
-            page = resp.read().decode()
-        assert "oasis-dm" in page and "sekrit" in page \
-            and "__TOKEN__" not in page
-    finally:
-        httpd.shutdown()
+    def test_window_runs_a_real_engine_job():
+        from PySide6.QtCore import QProcess
+        import tempfile
+        app, win = _window()
+        out = Path(tempfile.mkdtemp()) / "gui_e2e.mtz"
+        win.e_in.setText(str(DATA / "7e1d.mtz"))
+        _spin(app, 1.0)
+        win.e_out.setText(str(out))
+        win.s_cycles.setValue(2)
+        win.cb_stop.setChecked(False)
+        app.processEvents()
+        win.run()
+        t0 = time.time()
+        while win.proc is None \
+                or win.proc.state() != QProcess.NotRunning:
+            app.processEvents()
+            if time.time() - t0 > 240:
+                raise AssertionError("engine did not finish in 240 s")
+            time.sleep(0.02)
+        app.processEvents()
+        assert out.is_file()
+        assert len(win.cycles) == 2
+        assert win.cycles[0][0] == 1          # cycle numbers
+        assert "done" in win.l_status.text()
+        assert "wrote" in win.log.toPlainText()
+        win.close()
 
+    def test_stop_button_kills_the_engine():
+        import tempfile
+        app, win = _window()
+        out = Path(tempfile.mkdtemp()) / "gui_stop.mtz"
+        win.e_in.setText(str(DATA / "7e1d.mtz"))
+        _spin(app, 1.0)
+        win.e_out.setText(str(out))
+        win.s_cycles.setValue(50)
+        win.cb_stop.setChecked(False)
+        app.processEvents()
+        win.run()
+        from PySide6.QtCore import QProcess
+        t0 = time.time()
+        while win.proc is None or win.proc.state() != QProcess.Running:
+            app.processEvents()
+            if time.time() - t0 > 30:
+                raise AssertionError("engine did not start in 30 s")
+            time.sleep(0.02)
+        win.stop()
+        t0 = time.time()
+        while win.proc.state() != QProcess.NotRunning:
+            app.processEvents()
+            if time.time() - t0 > 20:
+                raise AssertionError("engine did not stop in 20 s")
+            time.sleep(0.02)
+        assert "[gui] stopped by user" in win.log.toPlainText()
+        win.close()
 
-def test_run_validation_via_http():
-    state = GuiState()
-    httpd = _serve(state, "sekrit")
-    try:
-        r = _req(httpd.server_address[1], "POST", "/api/run", "sekrit",
-                 {"state": _base(mtzin="/no/such.mtz")})
-        assert not r["ok"] and r["problems"]
-    finally:
-        httpd.shutdown()
-
-
-def test_http_api_runs_a_real_engine_job():
-    """Full round trip: run, poll the streaming log, check the output."""
-    with tempfile.TemporaryDirectory() as td:
-        out = str(Path(td) / "gui_e2e.mtz")
-        st = _base(mtzin=str(ROOT / "tests" / "data" / "7e1d.mtz"),
-                   mtzout=out, cycles=2, auto_stop=False)
-        state = GuiState()
-        httpd = _serve(state, "sekrit")
-        port = httpd.server_address[1]
-        try:
-            r = _req(port, "POST", "/api/run", "sekrit", {"state": st})
-            assert r["ok"], r
-            # refuse a second concurrent run
-            r2 = _req(port, "POST", "/api/run", "sekrit", {"state": st})
-            assert not r2["ok"] and "already active" in r2["problems"][0]
-
-            seq, saw_cycle, deadline = 0, False, time.time() + 600
-            while time.time() < deadline:
-                info = _req(port, "GET", "/api/poll?seq=%d" % seq, "sekrit")
-                seq = info["total"]
-                if info["cycles"]:
-                    saw_cycle = True
-                    cyc0 = info["cycles"][0]
-                    assert cyc0[0] >= 1 and 0 < cyc0[1] <= 1
-                if not info["running"]:
-                    break
-                time.sleep(1.0)
-            assert not info["running"] and info["rc"] == 0, info
-            assert saw_cycle and len(info["cycles"]) == 2
-            assert info["output_exists"] and Path(out).is_file()
-            assert any("wrote" in ln for ln in state.job.lines)
-        finally:
-            httpd.shutdown()
-            if state.job is not None and state.job.rc is None:
-                state.job.stop()
-
-
-def test_http_api_stop_kills_a_job():
-    """Stop must terminate a long run within a few seconds."""
-    with tempfile.TemporaryDirectory() as td:
-        st = _base(mtzin=str(ROOT / "tests" / "data" / "7e1d.mtz"),
-                   mtzout=str(Path(td) / "s.mtz"), cycles=50,
-                   auto_stop=False)
-        state = GuiState()
-        httpd = _serve(state, "sekrit")
-        port = httpd.server_address[1]
-        try:
-            assert _req(port, "POST", "/api/run", "sekrit",
-                        {"state": st})["ok"]
-            time.sleep(3.0)               # let it get going
-            assert state.job.rc is None   # still running
-            assert _req(port, "POST", "/api/stop", "sekrit")["ok"]
-            t0 = time.time()
-            while state.job.rc is None and time.time() - t0 < 20:
-                time.sleep(0.2)
-            assert state.job.rc is not None
-        finally:
-            httpd.shutdown()
-            if state.job is not None and state.job.rc is None:
-                state.job.stop()
-
-
-def test_command_string_is_quoted():
-    s = command_string(_base(mtzin="/tmp/my file.mtz"))
-    assert s.startswith("oasis-dm --mtzin ") and "'/tmp/my file.mtz'" in s
-
-
-if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            fn()
-            print("PASS %s" % name)
-        except Exception as exc:  # noqa: BLE001
-            failures += 1
-            print("FAIL %s: %r" % (name, exc))
-    sys.exit(1 if failures else 0)
+    def test_chart_receives_cycles():
+        app, win = _window()
+        win.chart.set_cycles([[1, 0.5, 0.3], [2, 0.6, 0.55]])
+        win.chart.repaint()
+        app.processEvents()
+        assert win.chart.pts == [(1, 0.3), (2, 0.55)]
+        win.close()

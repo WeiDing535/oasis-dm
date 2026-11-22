@@ -47,22 +47,33 @@ oasis-dm --mtzin input.mtz --mtzout output.mtz ... \
          --ncs ncs_operators.txt     # or --ncs-auto to detect + gate it
 ```
 
-## Graphical interface
+## Desktop app
+
+A native window (PySide6 / Qt 6) that maps one-to-one onto the command line: pick the
+input MTZ, it auto-detects the Fo / σ(Fo) / PHIB / FOM / free columns and suggests an
+output name; set solvent content, cycles, early stop, mask, histogram target, phase
+extension, NCS mode and the advanced SigmaQ options; the exact `oasis-dm` command line
+is shown live before you press Run. The engine then runs as a subprocess and its log
+streams into the window, with free-set cc plotted per cycle. Stop kills it cleanly.
 
 ```bash
-oasis-dm-gui            # or: python -m oasis_dm.gui
+pip install ".[gui]"     # once: adds PySide6-Essentials (LGPL)
+oasis-dm-gui             # or: python -m oasis_dm.gui
 ```
 
-starts a small local server (standard library only, bound to 127.0.0.1) and opens your
-browser. The page lets you pick the input MTZ from a directory browser, auto-detects the
-Fo / σ(Fo) / PHIB / FOM / free columns, exposes the engine options (solvent content,
-cycles, early stop, mask, histogram target, NCS mode, SigmaQ source, …), shows the exact
-`oasis-dm` command line before you run it, then streams the engine log and plots free-set
-cc per cycle. Stop terminates the subprocess cleanly. The engine always runs as
-`python -m oasis_dm`, so the GUI adds no new dependencies beyond the package itself —
-in particular no GUI toolkit is needed on the Python side (the Tcl/Tk shipped with system
-Pythons is frequently broken, e.g. it aborts on macOS 15 with the Xcode toolchain
-Python), which is why the interface is a browser page.
+**Double-clickable macOS app.** On macOS you can build a self-contained bundle that
+needs no Python installation at all — it embeds its own venv with PySide6:
+
+```bash
+python3 tools/make_macos_app.py     # -> dist/OasisDM.app
+open dist/OasisDM.app               # or double-click it in Finder
+```
+
+Why PySide6 and not Tkinter? The Tcl/Tk that ships with many system Pythons is broken —
+on the reference machine (macOS 15, Xcode toolchain Python 3.9.6) merely calling
+`tk.Tk()` aborts the process. PySide6 installs in one `pip` command, works there, and is
+LGPL-licensed. PySide6 is an optional extra: the package and the CLI never need it, and
+the test suite skips the window tests when it is absent.
 
 ---
 
@@ -321,8 +332,7 @@ src/oasis_dm/
   dm.py              v2 engine: omit map, free-set stopping, phase extension, CLI
   ncs.py             NCS averaging (operator I/O, lattice variants, auto-detection)
   cli.py             console entry point
-  gui.py             browser-based GUI (local HTTP server, engine subprocess)
-  gui_page.py        the GUI's single HTML page (no external assets)
+  gui.py             desktop GUI (PySide6 window, engine subprocess)
   paths.py           histogram-library resolution
   data/protein_hist.lib   bundled target distribution
 tools/
@@ -330,6 +340,7 @@ tools/
   evaluate.py        scoring against reference phases (plots optional)
   make_hist_lib.py   regenerate the bundled histogram library
   make_test_case.py  build a bundled-style test case (+ NCS operator files) from a PDB entry
+  make_macos_app.py  build a double-clickable dist/OasisDM.app with an embedded venv
   run_tests.py       test runner that needs no pytest
 tests/               smoke tests, numerics tests, bundled cases (incl. NCS cases)
 examples/            runnable example

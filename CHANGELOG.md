@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.4.0] — 2026-11-23
+
+A real desktop window — the browser GUI from 2.3.0 is withdrawn.
+
+### Changed
+
+- **`oasis-dm-gui` is now a native desktop application** (PySide6 / Qt 6)
+  instead of a browser page. Double-clicking the window is the normal way in;
+  it does not need a browser, a server, or a terminal. The 2.3.0 browser front
+  end was short-lived: it worked, but "a web page on localhost" is not what
+  people mean by a GUI, and it made the run history awkward to inspect. The
+  window keeps the same contract — one control per real CLI flag, only
+  non-default options emitted, the exact command line previewed live, the
+  engine log streamed, free-set cc plotted per cycle, Stop kills the engine
+  cleanly — and adds a native file picker and column auto-detection with a
+  header summary (`name · spacegroup · N reflections · d_min`).
+
+### Added
+
+- **`tools/make_macos_app.py`** — builds `dist/OasisDM.app`, a self-contained
+  double-clickable bundle that embeds its own virtual environment with PySide6
+  and the package, so it runs on a Mac without any Python setup. Verified by
+  launching the built bundle. Not signed; fine for local or lab use, and the
+  script says so.
+- Optional extra `pip install ".[gui]"` (PySide6-Essentials ≥ 6.5,
+  LGPL — the "Essentials" wheel, not the full PySide6, which drags in
+  WebEngine and triples the bundle size). The CLI and the
+  engine never import it, and the test suite skips the window tests when it is
+  missing, so CI stays toolkit-free.
+
+### Removed
+
+- `oasis_dm/gui_page.py` and the local HTTP server (2.3.0's browser interface).
+
+
 ## [2.3.0] — 2026-11-23
 
 A graphical interface, plus a version-string fix.
