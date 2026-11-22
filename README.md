@@ -4,7 +4,7 @@
 
 [![tests](https://github.com/WeiDing535/oasis-dm/actions/workflows/tests.yml/badge.svg)](https://github.com/WeiDing535/oasis-dm/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License: Academic Use](https://img.shields.io/badge/license-academic%20use-blue)](LICENSE)
 
 `oasis_dm` is a self-contained implementation of the density-modification step used in the
 [SAD / SADR pipeline](https://github.com/WeiDing535/OASIS4.3): solvent masking, histogram
@@ -346,7 +346,7 @@ the packaged CLI.
 
 ## Data and licensing
 
-- **Code**: MIT — see [LICENSE](LICENSE).
+- **Code** is free for noncommercial academic research and teaching under the [Academic Use License](LICENSE). Commercial use requires a paid license. Contact dingwei@iphy.ac.cn. Earlier MIT releases retain their [MIT terms](LICENSE-MIT-PREVIOUS.txt).
 - **Bundled test cases** (`tests/data/*.mtz`): derived from public PDB entries (`3o2e`,
   `6zpp`, `7e1d`) with simulated SAD observations. They contain `FOBS`, `SIGFOBS`, `FreeR`,
   `PHIB`, `FOM`, `PHIC` and HL coefficients `HLA`–`HLD`.

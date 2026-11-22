@@ -8,12 +8,11 @@ version = "2.3.0"
 description = "Density modification (phase improvement) for macromolecular crystallography, without CCP4"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = {file = "LICENSE"}
 authors = [{ name = "Wei Ding" }]
 keywords = ["crystallography", "density modification", "phase improvement",
             "SAD", "SIR", "MTZ", "solvent flattening", "histogram matching"]
 classifiers = [
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",

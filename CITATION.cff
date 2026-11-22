@@ -9,7 +9,6 @@ authors:
   - family-names: Ding
     given-names: Wei
 type: software
-license: MIT
 repository-code: "https://github.com/WeiDing535/oasis-dm"
 keywords:
   - density modification

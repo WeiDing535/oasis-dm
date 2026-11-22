@@ -1,21 +1,39 @@
-MIT License
+oasis-dm Academic Use License
 
-Copyright (c) 2026 Wei Ding
+Copyright (c) 2026 Wei Ding. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Free academic use
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Permission is granted, without a license fee, to individuals and institutions
+to run, copy and modify the covered software for noncommercial academic
+research or teaching. Copies and modifications may be shared within the
+academic project for those purposes, provided this notice is retained.
+Publication and reuse of scientific results do not require a software license
+fee. The software itself remains subject to this license.
+
+2. Commercial use and redistribution
+
+Commercial use requires a separate paid license agreed in writing before use.
+Commercial use includes use in commercial products or services, paid analysis
+for clients, or work carried out for a company's commercial research or
+product development. Contact dingwei@iphy.ac.cn for commercial licensing.
+Other use or redistribution of the covered software requires prior written
+permission, except where permitted by applicable law or the terms of the
+hosting platform.
+
+3. Scope
+
+This license covers the project code released under this notice for which
+Wei Ding holds the necessary rights. Third-party components, dependencies and
+data remain subject to their own notices. This license does not alter
+permissions already granted for copies under earlier licenses.
+
+See LICENSE-MIT-PREVIOUS.txt for the notice covering earlier MIT releases.
+
+4. Disclaimer
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. TO THE EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER IS NOT
+LIABLE FOR CLAIMS, DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS
+USE.
